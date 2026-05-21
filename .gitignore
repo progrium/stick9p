@@ -1,0 +1,13 @@
+# Local experiments and secrets
+.local/
+
+# Rust / ESP build artifacts
+/target/
+**/target/
+Cargo.lock
+
+# ESP-IDF / espflash
+.fingerprint/
+
+# Editor
+.vscode/*.log

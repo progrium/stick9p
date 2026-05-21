@@ -1,0 +1,10 @@
+[package]
+name = "devices"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Stick device drivers and shared state"
+
+[dependencies]
+critical-section = "1.2.0"
+heapless = "0.8"

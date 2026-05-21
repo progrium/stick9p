@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "firmware",
+    "ninep",
+    "devices",
+]
+exclude = ["tools/stick9p-bridge"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+# ESP firmware profiles (must live at workspace root)
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"

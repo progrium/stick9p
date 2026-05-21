@@ -1,0 +1,100 @@
+[package]
+name = "firmware"
+edition = "2024"
+version.workspace = true
+license.workspace = true
+rust-version = "1.88"
+description = "M5Stack Stick 9P file server firmware (esp-hal + Embassy)"
+
+[[bin]]
+name = "firmware"
+path = "./src/bin/main.rs"
+
+[features]
+default = ["board-plus2"]
+board-plus2 = [
+  "esp-backtrace/esp32",
+  "esp-bootloader-esp-idf/esp32",
+  "esp-hal/esp32",
+  "esp-println/esp32",
+  "esp-radio/esp32",
+  "esp-rtos/esp32",
+  "esp-storage/esp32",
+]
+board-sticks3 = [
+  "esp-backtrace/esp32s3",
+  "esp-bootloader-esp-idf/esp32s3",
+  "esp-hal/esp32s3",
+  "esp-println/esp32s3",
+  "esp-radio/esp32s3",
+  "esp-rtos/esp32s3",
+  "esp-storage/esp32s3",
+]
+
+[dependencies]
+devices = { path = "../devices" }
+ninep = { path = "../ninep", features = ["server", "log"] }
+
+esp-hal = { version = "~1.1.0", features = ["unstable"] }
+esp-rtos = { version = "0.3.0", features = [
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+] }
+esp-bootloader-esp-idf = { version = "0.5.0" }
+esp-storage = { version = "0.8.1" }
+
+embedded-storage = "0.3.1"
+
+embassy-net = { version = "0.8.0", features = [
+  "dhcpv4",
+  "medium-ethernet",
+  "tcp",
+  "udp",
+] }
+embedded-io = "0.7.1"
+embedded-io-async = "0.7.0"
+esp-alloc = "0.10.0"
+esp-backtrace = { version = "0.19.0", features = ["panic-handler", "println"] }
+esp-println = { version = "0.17.0" }
+embassy-executor = { version = "0.10.0", features = [] }
+embassy-time = "0.5.0"
+embassy-futures = "0.1.2"
+embassy-sync = "0.7.2"
+esp-radio = { version = "0.18.0", features = [
+  "esp-alloc",
+  "unstable",
+  "wifi",
+] }
+smoltcp = { version = "0.13.0", default-features = false, features = [
+  "medium-ethernet",
+  "multicast",
+  "proto-dhcpv4",
+  "proto-dns",
+  "proto-ipv4",
+  "socket-dns",
+  "socket-icmp",
+  "socket-raw",
+  "socket-tcp",
+  "socket-udp",
+] }
+
+edge-dhcp = "0.7.0"
+edge-nal = "0.6.0"
+edge-nal-embassy = "0.8.1"
+
+critical-section = "1.2.0"
+static_cell = "2.1.1"
+heapless = { version = "0.8", features = ["serde"] }
+sha1 = { version = "0.10", default-features = false }
+embedded-hal = "1.0.0"
+embedded-hal-bus = "0.3.0"
+embedded-graphics-core = "0.4.0"
+display-interface = "0.5.0"
+display-interface-spi = "0.5.0"
+mipidsi = "0.8.0"
+nb = "1.1.0"
+
+[lib]
+name = "firmware"
+path = "src/lib.rs"
