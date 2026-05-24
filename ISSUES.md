@@ -126,3 +126,47 @@ dd if=/mnt/stick/dev/mic/pcm of=clip.raw bs=4096 count=50
 - None on device today. Stage 3 mic remains **tree + ctl API only** until PDM capture works.
 
 ---
+
+## `/dev/led` — no software control on StickS3
+
+**Status:** Open (deferred)  
+**Board:** M5Stack StickS3 only
+
+### Symptoms
+
+- `echo on > /dev/led/ctl`, `echo blink … > /dev/led/ctl`, and `echo off > /dev/led/ctl` all succeed at the 9P layer; `cat /dev/led/state` reflects the requested state.
+- The physical green LED on the device **does not respond** to those writes.
+- Observed behaviour: M5PM1 firmware drives the LED itself — it blinks briefly during boot/charging cycles and then sits solid on while the device is running normally.
+
+### Investigation summary
+
+Confirmed by reading back the M5PM1 register file after our init sequence on HW rev 5 / SW rev 0x4f (matching DESIGN.md notes):
+
+| Register | Final value | Meaning |
+|----------|-------------|---------|
+| `DEVICE_ID` (0x00) | `0x50` | Correct chip |
+| `GPIO_MODE` (0x10) | `0x01` | GPIO0 = output |
+| `GPIO_OUT` (0x11) | `0x01` | GPIO0 high |
+| `GPIO_DRV` (0x13) | `0x1e` | LED_EN_DRV bit 5 = 0 (push-pull) |
+| `GPIO_FUNC0` (0x16) | `0x03` | GPIO0 = OTHER (LED_EN / NeoPixel) |
+| `PWR_CFG` (0x06) | `0x17` | LED_CTRL bit 4 = 1 (rail on) |
+| `NEO_CFG` (0x50) | `0x01` | LED count = 1 |
+
+A boot-time probe (`firmware/src/dev/sticks3.rs::probe_led_paths`, since removed) tried three control paths back-to-back — NeoPixel write+refresh, plain GPIO_OUT toggle on GPIO0, and `PWR_CFG` bit 4 toggle. None of them visibly overrode the M5PM1's built-in status pattern; the LED behaved like an autonomous power indicator.
+
+### Hypothesis
+
+`DESIGN.md` line 45 describes the LED as *"firmware-controlled flash patterns (500 ms in download mode, etc.) — driven by PWR_CFG bit 4"*. We now believe **the M5PM1 internal firmware owns the LED** for status indication, and the user-facing `LED_CTRL` / NeoPixel registers are intended for **other M5Stack products** (e.g. StampS3Bat's RGB LED) that share the same PMIC. The official M5PM1 NeoPixel example notes that `setLedEnLevel()` is *"mainly for the Stamp-S3Bat product"*.
+
+### Things to verify when revisiting
+
+1. **Check schematic v0.6 (2025-11-11)** for the actual LED wiring — is the cathode tied to a separate M5PM1 pin we haven't tried (e.g. PYG1), or routed through the AW8737 amplifier rail?
+2. **Read `IRQ_STATUS3` (0x42)** to see if M5PM1 button/status events keep retriggering the LED pattern; if so, masking via `IRQ_MASK3` (0x45) might quiet the chip.
+3. **Try M5PM1 sleep/wake cycle** — `setLedEnLevel` may only take effect after a `shutdown`/`sleep` round-trip.
+4. **Compare with a fresh M5Unified-based Arduino sketch** running on the same StickS3; if M5Unified can blink the LED, instrument the I²C bus to capture the exact register sequence.
+
+### Workarounds
+
+- None today. The 9P `/dev/led/*` surface remains in place so the **schema stays uniform across boards**, but writes are no-ops on StickS3. `/dev/led/state` still reflects the requested state for clients that care.
+
+---

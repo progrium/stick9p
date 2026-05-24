@@ -83,17 +83,28 @@ pub async fn run(spawner: &Spawner, wifi: esp_hal::peripherals::WIFI<'static>) -
 }
 
 fn ap_credentials() -> ProvisionInfo {
+    // Derive stable SSID + password from the efuse MAC so the credentials don't
+    // change across reboots. SSID suffix = last 2 MAC bytes; password = 8 chars
+    // mixed from all 6 MAC bytes.
+    let mac = esp_hal::efuse::base_mac_address();
+    let bytes = mac.as_bytes();
+
     let mut ssid = heapless::String::<24>::new();
     let _ = ssid.push_str("Stick9p-");
-    let suffix = (Rng::new().random() & 0xffff) as u16;
+    let suffix = ((bytes[4] as u16) << 8) | bytes[5] as u16;
     push_hex4(suffix, &mut ssid);
 
     const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
     let mut password = heapless::String::<16>::new();
-    let mut rng = Rng::new();
+    // Simple deterministic mixer: rolling FNV-like hash seeded with a constant.
+    let mut h: u32 = 0x9e37_79b9;
     for _ in 0..8 {
-        let idx = (rng.random() as usize) % CHARSET.len();
+        for &b in bytes {
+            h = h.wrapping_mul(0x0100_0193) ^ b as u32;
+        }
+        let idx = (h as usize) % CHARSET.len();
         let _ = password.push(CHARSET[idx] as char);
+        h = h.wrapping_add(0x6c07_8965);
     }
 
     ProvisionInfo { ssid, password }

@@ -14,7 +14,7 @@ Full architecture and hardware targets: [DESIGN.md](DESIGN.md). Open bugs: [ISSU
 | `/dev/buttons/event` | Broken — see [ISSUES.md](ISSUES.md) |
 | `/dev/display/brightness` | On/off only — dimming deferred |
 | `/dev/mic/pcm` | Tree + ctl present; **no capture** (`queued=0`) — [ISSUES.md](ISSUES.md) |
-| StickS3 (`board-sticks3`) | Builds; **no device tasks** in `main` yet |
+| StickS3 (`board-sticks3`) | Wi‑Fi + 9P + ST7789P3 display (boot/ready splash) working; M5PM1 init enables L3B; `/dev/led/*` no‑op on hardware ([ISSUES.md](ISSUES.md)); IMU/buttons/audio not yet wired |
 
 Firmware version string: `stick9p-0.3.0-stage3-mic` (`cat /mnt/stick/sys/version`).
 
@@ -55,11 +55,16 @@ cargo build -p firmware
 cargo run -p firmware    # flash + monitor (USB serial, CH9102 on Plus2)
 ```
 
-StickS3 (Wi‑Fi + 9P only until hardware bring-up lands):
+StickS3 (Wi‑Fi + 9P + display; IMU/buttons/audio still to land):
 
 ```bash
-cargo build -p firmware --no-default-features --features board-sticks3
+cargo build -p firmware --no-default-features --features board-sticks3 --target xtensa-esp32s3-none-elf
+cargo run -p firmware --no-default-features --features board-sticks3 --target xtensa-esp32s3-none-elf
 ```
+
+The repo default `.cargo/config.toml` target is **Plus2** (`xtensa-esp32-none-elf`); StickS3 builds must pass `--target xtensa-esp32s3-none-elf` (or override `build.target` in a local config).
+
+**StickS3 serial / flash notes:** Native USB-JTAG — use `--before usb-reset --after hard-reset` (already set in the S3 runner). If the monitor shows `boot:0x23 (DOWNLOAD)` and `waiting for download`, the chip is in the ROM bootloader, not running firmware: close other serial tools, **quick-press** the side reset button once, then re-flash. Run `espflash monitor` from Terminal.app/iTerm (Cursor’s terminal often fails with “Failed to initialize input reader”). On boot the LCD shows a `stick9p / booting…` banner, then a green **READY / ip …** banner once WiFi associates — visible confirmation that the new flash came up.
 
 ## First boot and mount
 

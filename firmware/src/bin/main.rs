@@ -10,6 +10,7 @@ use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 use firmware::board;
+#[cfg(feature = "board-plus2")]
 use firmware::led_task;
 use firmware::net;
 use firmware::nvs;
@@ -24,8 +25,17 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 40 * 1024);
     esp_alloc::heap_allocator!(size: 24 * 1024);
+    // StickS3 has 512 KB internal SRAM and we don't (yet) init the OPI PSRAM,
+    // so reserve another chunk for the 64,800-byte framebuffer + display ctl
+    // bookkeeping. Plus2 gets the same space from psram_allocator! below.
+    #[cfg(feature = "board-sticks3")]
+    esp_alloc::heap_allocator!(size: 96 * 1024);
 
-    println!("stick9p Stage 3 — board {}", board::BOARD_NAME);
+    println!();
+    println!("=====================================================");
+    println!(" stick9p Stage 3 — board {}", board::BOARD_NAME);
+    println!(" build: {} {}", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_NAME"));
+    println!("=====================================================");
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -61,6 +71,23 @@ async fn main(spawner: Spawner) -> ! {
             peripherals.DMA_I2S0,
             peripherals.GPIO0,
             peripherals.GPIO34,
+        );
+    }
+
+    #[cfg(feature = "board-sticks3")]
+    {
+        firmware::dev::spawn(
+            &spawner,
+            peripherals.I2C0,
+            peripherals.GPIO47,
+            peripherals.GPIO48,
+            peripherals.SPI2,
+            peripherals.GPIO39,
+            peripherals.GPIO40,
+            peripherals.GPIO45,
+            peripherals.GPIO41,
+            peripherals.GPIO21,
+            peripherals.GPIO38,
         );
     }
 

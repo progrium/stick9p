@@ -244,6 +244,45 @@ pub fn splash_provision(ssid: &str, password: &str) {
     });
 }
 
+/// Pre-WiFi banner shown immediately after the panel comes up.
+pub fn splash_booting(board: &str) {
+    critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        st.scale = 1;
+        let Some(fb) = st.fb.as_deref_mut() else {
+            return;
+        };
+        fill_fb(fb, 0, 0, 0);
+        draw_text_scaled(fb, 4, 8, 0xff, 0xff, 0xff, "stick9p", 2);
+        draw_text_scaled(fb, 4, 32, 0x80, 0xc0, 0xff, "booting...", 1);
+        let mut line = heapless::String::<24>::new();
+        let _ = line.push_str("board: ");
+        let _ = line.push_str(board);
+        draw_text_scaled(fb, 4, 48, 0xa0, 0xa0, 0xa0, line.as_str(), 1);
+        st.dirty = true;
+    });
+}
+
+/// STA-mode "ready" banner: green title + IP.
+pub fn splash_ready(ip: &str) {
+    critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        st.scale = 1;
+        let Some(fb) = st.fb.as_deref_mut() else {
+            return;
+        };
+        fill_fb(fb, 0, 0, 0);
+        draw_text_scaled(fb, 4, 8, 0x00, 0xff, 0x00, "READY", 2);
+        let mut line = heapless::String::<48>::new();
+        let _ = line.push_str("ip:  ");
+        let _ = line.push_str(ip);
+        draw_text_scaled(fb, 4, 40, 0xff, 0xff, 0xff, line.as_str(), 1);
+        draw_text_scaled(fb, 4, 56, 0xa0, 0xa0, 0xa0, "9p tcp/564", 1);
+        draw_text_scaled(fb, 4, 72, 0xa0, 0xa0, 0xa0, "ws  /9p:8080", 1);
+        st.dirty = true;
+    });
+}
+
 fn handle_ctl_line(cmd: &str) -> Result<(), &'static str> {
     if cmd == "on" {
         critical_section::with(|cs| STATE.borrow(cs).borrow_mut().on = true);

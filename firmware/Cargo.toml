@@ -17,6 +17,7 @@ board-plus2 = [
   "esp-bootloader-esp-idf/esp32",
   "esp-hal/esp32",
   "esp-println/esp32",
+  "esp-println/auto",
   "esp-radio/esp32",
   "esp-rtos/esp32",
   "esp-storage/esp32",
@@ -26,6 +27,7 @@ board-sticks3 = [
   "esp-bootloader-esp-idf/esp32s3",
   "esp-hal/esp32s3",
   "esp-println/esp32s3",
+  "esp-println/jtag-serial",
   "esp-radio/esp32s3",
   "esp-rtos/esp32s3",
   "esp-storage/esp32s3",
@@ -56,7 +58,7 @@ embedded-io = "0.7.1"
 embedded-io-async = "0.7.0"
 esp-alloc = "0.10.0"
 esp-backtrace = { version = "0.19.0", features = ["panic-handler", "println"] }
-esp-println = { version = "0.17.0" }
+esp-println = { version = "0.17.0", default-features = false, features = ["colors", "critical-section"] }
 embassy-executor = { version = "0.10.0", features = [] }
 embassy-time = "0.5.0"
 embassy-futures = "0.1.2"

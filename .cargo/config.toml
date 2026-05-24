@@ -1,6 +1,9 @@
 [target.xtensa-esp32-none-elf]
 runner = "espflash flash --monitor --chip esp32"
 
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor --chip esp32s3 --before usb-reset --after hard-reset"
+
 [env]
 
 [build]

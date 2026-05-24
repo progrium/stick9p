@@ -602,16 +602,17 @@ The repo's `.local/exp1/` TinyGo firmware targets **Plus2-class ESP32** (`esp32-
 ## Recommendations
 
 **Stage 1 — get a 9P shell working over TCP + provisioning:**
-1. Bring up esp-hal + Embassy on StickS3 (`esp32s3`); verify blinky on M5PM1 LED (I²C 0x6E driver).
+1. Bring up esp-hal + Embassy on StickS3 (`esp32s3`); init the M5PM1 PMIC over I²C 0x6E. ⚠ The single green LED is **autonomously driven by the M5PM1 firmware** and is not user-controllable from our side; `/dev/led/*` writes succeed at the 9P layer but produce no visible change. See ISSUES.md.
 2. Implement **WiFi provisioning** (§4.8): soft-AP, captive DNS, HTTP form, NVS, display splash, reboot-to-STA. Confirm with a phone — no serial config.
 3. Bring up WiFi STA, `embassy-net`, mDNS `stick9p.local`, TCP/564.
 4. Write `ninep::wire` + `ninep::server`; test `mount -t 9p` and `9p ls`.
-5. Wire `/sys/*` and `/dev/led/*`; prove `echo blink 200 200 > /mnt/stick/dev/led/ctl`.
+5. Wire `/sys/*` and `/dev/led/*` (schema is uniform across boards even when LED is hardware-internal).
 6. Add **WebSocket** transport (`transport/ws.rs`, :8080/9p); smoke-test with browser or `websocat`.
 
 **Stage 2 — sensors & display:**
 5. Add `/dev/power` (full M5PM1 register-map exposure), `/dev/imu`, `/dev/buttons`, `/dev/ir`. Each is a separate `task` + `Node`.
-6. Add `/dev/display/{fb,ctl,brightness}` with mipidsi over SPI; framebuffer in PSRAM; embedded 8×8 font + `text`/`scale` ctl commands.
+6. Add `/dev/display/{fb,ctl,brightness}` with mipidsi over SPI; framebuffer in PSRAM (Plus2) or internal RAM (StickS3, 96 KB heap reservation); embedded 8×8 font + `text`/`scale` ctl commands.
+   - **StickS3 ordering quirk:** the LCD's analog supply, mic supply, and speaker amp all share the **L3B** rail, gated by M5PM1 `PYG2` (FUNC1 bits[1:0] = `0b11` → `L3B_EN`, GPIO_MODE bit2 = output, GPIO_OUT bit2 = 1). Without that, GPIO38 driven high alone leaves the panel dark — `mipidsi::Builder::init` will still ACK over SPI (no MISO) so it looks fine in logs. Synchronize the display task to wait for the M5PM1 init to signal L3B is up before the first SPI transaction.
 
 **Stage 3 — audio:**
 7. Implement an `ES8311` Rust driver (port from Espressif's BSP C code), I²S DMA via esp-hal's `i2s` module.

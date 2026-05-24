@@ -121,5 +121,9 @@ pub fn spawn_sta_services(spawner: &Spawner, stack: Stack<'static>) {
 pub fn log_ip(stack: &Stack<'static>) {
     if let Some(cfg) = stack.config_v4() {
         println!("net: ip {}", cfg.address);
+        let mut ip_str = heapless::String::<24>::new();
+        use core::fmt::Write;
+        let _ = write!(&mut ip_str, "{}", cfg.address);
+        display::splash_ready(ip_str.as_str());
     }
 }

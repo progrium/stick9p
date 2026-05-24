@@ -52,7 +52,7 @@ Board-specific gaps and open bugs are noted inline; see the repo `ISSUES.md` on 
         └── pcm         s16le mono PCM stream (CAPTURE BROKEN)
 ```
 
-**Not on Plus2:** `dev/spk`, IR, M5PM1 rails, StickS3-only nodes. **StickS3** firmware profile exists but device tasks are not wired yet.
+**Not on Plus2:** `dev/spk`, IR, M5PM1 rails, StickS3-only nodes. **StickS3** firmware profile boots, runs Wi‑Fi + 9P, and drives the ST7789P3 LCD (M5PM1 L3B rail enabled at init, GPIO38 backlight pulsed up after L3B is ready); `/dev/led/*` is no‑op on hardware (M5PM1-owned status LED, see [ISSUES.md](ISSUES.md)); IMU, buttons, battery sense, and audio are not wired yet.
 
 ---
 
