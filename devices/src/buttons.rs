@@ -68,11 +68,10 @@ pub fn read_b(off: u64, buf: &mut [u8]) -> usize {
     critical_section::with(|cs| read_level(off, buf, STATE.borrow(cs).borrow().b))
 }
 
-/// Read one queued event line at offset 0 (non-blocking). Returns 0 when idle.
-pub fn try_read_event(off: u64, buf: &mut [u8]) -> usize {
-    if off != 0 {
-        return 0;
-    }
+/// Read one queued event line (non-blocking). Offset is ignored — this is a
+/// pipe; v9fs increments offset after each read, but we always pop from the
+/// front of the queue regardless.
+pub fn try_read_event(_off: u64, buf: &mut [u8]) -> usize {
     critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         if st.events.is_empty() {

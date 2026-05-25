@@ -4,47 +4,63 @@ Tracked bugs and gaps not yet fixed. Stage 3 adds Plus2 PDM mic (`/dev/mic`); sp
 
 ---
 
-## `/dev/buttons/event` does not stream presses
+## `/dev/buttons/event` — events delivered in batches under `cat`
 
-**Status:** Open (deferred)  
-**Board:** M5StickC Plus2 (GPIO37 = A, GPIO39 = B, active-low)
+**Status:** Working with v9fs quirk (events buffered ~16 deep before `cat` prints)
+**Board:** M5StickC Plus2 (GPIO37 = A, GPIO39 = B, active-low); StickS3 (GPIO11/12)
 
 ### Symptoms
 
-- `cat dev/buttons/a` and `cat dev/buttons/b` reflect level correctly (`1` = pressed, `0` = released).
-- `cat dev/buttons/event` blocks (Ctrl+C works) but **no lines appear** when A/B are pressed and released.
-- `echo flush > dev/buttons/ctl` or `> dev/buttons/event` should clear the queue; ctl write was failing with I/O error on some builds (mode / firmware mismatch); event write path added as alternate.
-- Earlier builds: stale queued lines drained without touching the button; then read hung (fixed: removed broken `pending` partial-read state). Directory `ls dev/buttons` panicked on 128-byte copy buffer (fixed).
+- `cat dev/buttons/a` / `b` reflect level correctly (`1` = pressed, `0` = released).
+- `cat dev/buttons/event` produces correct lines (`a down`, `a up`, `b down`, `b up`) but **only flushes after ~16 button transitions** — `cat`'s userspace buffer must fill before the kernel returns data.
+- `dd bs=8 count=1 if=dev/buttons/event` returns a single event immediately as expected.
+- `echo flush > dev/buttons/ctl` / `> dev/buttons/event` clears the queue.
 
-### Expected behavior (DESIGN.md)
+### Root cause: this kernel's `p9_client_read` is non-standard
 
-- Newline-delimited edge stream: `a down\n`, `a up\n`, `b down\n`, `b up\n`.
-- Each `Tread` returns one line; blocking read until an edge is queued.
+We confirmed via serial logs that the firmware delivers each event as soon as it occurs (single `Rread` of 7 or 5 bytes per transition). The batching is entirely on the client side. We tried two spec-compliant ways to terminate `p9_client_read`'s fill loop after each event and both failed on this kernel:
+
+1. **`Rread(0 bytes)` follow-up** — kernel did **not** treat as EOF/end-of-loop; it immediately reissued a `Tread` at the same offset, ignoring the zero-length reply.
+2. **`Rerror` follow-up** — kernel **propagated the error to `cat`** even though bytes were already accumulated (`read()` returned `-EAGAIN`, no data delivered). Result: `cat: read error: Resource temporarily unavailable`.
+
+The only thing that terminates the loop is filling the whole `Tread` count buffer with payload. Current firmware therefore **zero-pads each event to fill the full negotiated `max_count` (≈4072 bytes)**, which satisfies the kernel's fill loop in a single response. `cat`'s internal `read()` buffer is ~65536 bytes, so ~16 padded responses are accumulated before `cat` calls `write()` to stdout — hence the batching.
 
 ### Implementation notes
 
 | Layer | Location |
 |-------|----------|
-| GPIO poll + edge detect | `firmware/src/dev/plus2.rs` — `buttons_task`, 20 ms period |
+| GPIO poll + edge detect | `firmware/src/dev/plus2.rs`, `firmware/src/dev/sticks3.rs` — `buttons_task`, 25 ms period |
 | Queue + `try_read_event` | `devices/src/buttons.rs` |
 | 9P tree | `ninep/src/fs.rs` — `event`, `ctl` (`flush`) |
-| Blocking read without wedging mount | `ninep/src/server.rs` — deferred `WaitEvent`, poll + interleaved packets |
+| Blocking read (`WaitStream` + zero-padded response) | `ninep/src/server.rs` — `handle_read` / pend-drain for `DevBtnEvent` |
+| `Tclunk` cancels stale `WaitStream` (was leaking) | `ninep/src/server.rs::handle_clunk` |
 
-Edges are pushed only on **change** (`a_down != prev_a`). Level files update every poll via `set_a` / `set_b`.
+### Side fixes made while investigating
 
-### Things to verify when revisiting
+- **`Tflush` (type `108`) was decoded as type `102`** — every `^C` on `cat` produced `unknown typ=108` and `Rerror` reply, leaving v9fs's request table corrupt. Fixed: `TFLUSH = 108`, `RFLUSH = 109`, proper handler pairs `Rflush` and clears matching `pending_stream`.
+- **`read_until_deadline` ignored the timeout** — replaced with `embassy_futures::select` so the server actually polls the event queue while blocked on a read.
+- **`PendingStreamRead.fid`** added so `handle_clunk` can cancel a `WaitStream` belonging to a closed fid; stale pend-drains used to fire against new sessions.
 
-1. **Edges actually queued** — serial log in `push_event` or queue depth after press/release while `cat event` is blocked.
-2. **`buttons_task` running** — if `a`/`b` levels update, task is alive; confirm `push_event` is reached on transitions.
-3. **9P read path** — `handle_read` on `DevBtnEvent` uses `buttons::try_read_event`; deferred wait loop in `Session::run` should deliver Rread when queue non-empty.
-4. **Client offset** — reads must use offset `0` per event line; non-zero offset returns 0 (EOF). Confirm v9fs `cat` first read offset is 0.
-5. **Per-fid queues** — DESIGN calls for per-open-fid event streams; current design is one global queue (should still deliver events to one reader).
-6. **Debounce** — 20 ms sample may miss very fast taps; unlikely to explain zero events on normal press/release.
+### Workarounds for single-event delivery
 
-### Workarounds
+The batching only affects clients that read with large buffers (`cat`, most stdio tools). Tools that issue small reads see one event at a time:
 
-- Poll levels: `cat dev/buttons/a` / `b` in a shell loop.
-- Revisit after Stage 2 polish or when adding StickS3 button GPIOs (different pins).
+```sh
+# one event per dd invocation
+dd bs=12 count=1 if=/mnt/stick/dev/buttons/event 2>/dev/null
+
+# streaming with shell loop
+while dd bs=12 count=1 if=/mnt/stick/dev/buttons/event 2>/dev/null; do :; done
+```
+
+For programs you control, `read(fd, buf, 12)` will return one event per call.
+
+### Possible future fixes
+
+1. **Different v9fs mount option / protocol** — try `9p2000.L` (`-o version=9p2000.L`) which uses a different read path that may honor short reads. Would require Tlread/Rlread support in the server.
+2. **`cache=fscache` or similar** — already tried `cache=none`; no effect on the fill-loop behavior.
+3. **Per-fid record framing** — `length()` already returns `u32::MAX` for streaming files; nothing else in the read path obviously gates the loop.
+4. **Custom client** — a small `bevent` reader binary on the device side that does small reads and prints lines (analogous to `acme`'s event reader on Plan 9).
 
 ---
 

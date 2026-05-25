@@ -380,6 +380,9 @@ impl Node {
         match self {
             Node::Readme => crate::readme::TEXT.len() as u64,
             Node::DevDisplayFb => devices::display::FB_LEN as u64,
+            // Streaming files: large fake length prevents v9fs page cache from
+            // returning EOF based on i_size=0 before data is available.
+            Node::DevBtnEvent | Node::DevMicPcm | Node::DevSpkPcm => u32::MAX as u64,
             _ => 0,
         }
     }

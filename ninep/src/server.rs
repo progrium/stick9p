@@ -9,7 +9,7 @@ use crate::wire::{
 };
 use devices::{buttons, mic};
 use embedded_io_async::{Read, Write};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 
 #[cfg(feature = "log")]
 macro_rules! ninep_log {
@@ -26,6 +26,7 @@ const EVENT_POLL_MS: u64 = 25;
 struct PendingStreamRead {
     tag: u16,
     count: u32,
+    fid: u32,
 }
 
 enum PendingKind {
@@ -35,7 +36,7 @@ enum PendingKind {
 
 enum DispatchResult {
     Reply(usize),
-    WaitStream { kind: PendingKind, tag: u16, count: u32 },
+    WaitStream { kind: PendingKind, tag: u16, count: u32, fid: u32 },
 }
 
 struct FidSlot {
@@ -59,6 +60,7 @@ pub struct Session<'a, S> {
     fids: [FidSlot; MAX_FIDS],
     storage: &'a mut SessionStorage,
     pending_stream: Option<(PendingKind, PendingStreamRead)>,
+    btn_poll_count: u32,
 }
 
 impl<'a, S> Session<'a, S>
@@ -72,6 +74,7 @@ where
             msize: DEFAULT_MSIZE,
             fids: [FidSlot::EMPTY; MAX_FIDS],
             storage,
+            btn_poll_count: 0,
             pending_stream: None,
         }
     }
@@ -82,7 +85,19 @@ where
                 let max_count = max_read_count(p.count, self.msize);
                 let buf = &mut self.storage.rx[..max_count];
                 let n = match kind {
-                    PendingKind::BtnEvent => buttons::try_read_event(0, buf),
+                    PendingKind::BtnEvent => {
+                        let n = buttons::try_read_event(0, buf);
+                        self.btn_poll_count += 1;
+                        if n > 0 || self.btn_poll_count % 40 == 1 {
+                            ninep_log!("9p: btn poll n={} total={}", n, self.btn_poll_count);
+                        }
+                        if n > 0 && n < buf.len() {
+                            buf[n..].fill(0);
+                            buf.len()
+                        } else {
+                            n
+                        }
+                    }
                     PendingKind::MicPcm => mic::try_read_pcm(0, buf),
                 };
                 if n > 0 {
@@ -127,8 +142,8 @@ where
                     }
                     let _ = flush_stream(&mut self.stream).await;
                 }
-                DispatchResult::WaitStream { kind, tag, count } => {
-                    self.pending_stream = Some((kind, PendingStreamRead { tag, count }));
+                DispatchResult::WaitStream { kind, tag, count, fid } => {
+                    self.pending_stream = Some((kind, PendingStreamRead { tag, count, fid }));
                 }
             }
         }
@@ -170,7 +185,7 @@ where
                 let out = &mut self.storage.tx;
                 let mut o = 0usize;
                 put_u32(out, &mut o, 7);
-                put_u8(out, &mut o, 103);
+                put_u8(out, &mut o, wire::RFLUSH);
                 put_u16(out, &mut o, tag);
                 Ok(DispatchResult::Reply(o))
             }
@@ -493,12 +508,31 @@ where
                 tag, offset, count, max_count, n, mic::is_running()
             );
         }
-        if node == Node::DevBtnEvent && offset == 0 && n == 0 {
-            return Ok(DispatchResult::WaitStream {
-                kind: PendingKind::BtnEvent,
+        if node == Node::DevBtnEvent {
+            let n = if n > 0 && n < max_count {
+                // Zero-pad to fill the requested buffer so p9_client_read's fill-loop
+                // is satisfied in one Tread, no follow-up 0-byte or error response needed.
+                // (This kernel neither breaks on Rread(0) nor tolerates Rerror mid-stream.)
+                data[n..max_count].fill(0);
+                max_count
+            } else {
+                n
+            };
+            if n == 0 {
+                ninep_log!("9p: WaitStream BtnEvent tag={} off={}", tag, offset);
+                return Ok(DispatchResult::WaitStream {
+                    kind: PendingKind::BtnEvent,
+                    tag,
+                    count,
+                    fid,
+                });
+            }
+            let payload = &self.storage.rx[..n];
+            return Ok(DispatchResult::Reply(build_read_reply(
+                &mut self.storage.tx,
                 tag,
-                count,
-            });
+                payload,
+            )));
         }
         if node == Node::DevMicPcm && n == 0 && mic::is_running() {
             ninep_log!("9p: WaitStream MicPcm tag={} count={}", tag, count);
@@ -506,6 +540,7 @@ where
                 kind: PendingKind::MicPcm,
                 tag,
                 count,
+                fid,
             });
         }
         let payload = &self.storage.rx[..n];
@@ -580,6 +615,12 @@ where
     fn handle_clunk(&mut self, tag: u16, fid: u32) -> Result<DispatchResult, ()> {
         if let Some(slot) = self.fids.get_mut(fid as usize) {
             *slot = FidSlot::EMPTY;
+        }
+        // If this fid had an active WaitStream, cancel it so stale pend-drains
+        // don't fire after the file is closed.
+        if self.pending_stream.as_ref().map_or(false, |(_, p)| p.fid == fid) {
+            ninep_log!("9p: cancel pending stream fid={}", fid);
+            self.pending_stream = None;
         }
         let out = &mut self.storage.tx;
         let mut o = 0usize;

@@ -275,9 +275,31 @@ cat dev/buttons/b
 
 ## `/dev/buttons/event`
 
-**Status: broken on current firmware.** Intended: newline-delimited edges `a down\n`, `a up\n`, `b down\n`, `b up\n`. Blocking read should wait for transitions; today **`cat` blocks with no output**.
+Newline-delimited edge stream: `a down`, `a up`, `b down`, `b up`. Blocking read until a transition occurs.
 
-Workaround: poll levels in a loop:
+**Quirk under `cat`:** this kernel's v9fs `p9_client_read` won't deliver short reads to userspace until its ~64 KB buffer fills. Events do reach the firmware immediately (verified via serial), but `cat` batches them ~16 at a time. Tools that issue small reads see one event at a time:
+
+```bash
+dd bs=12 count=1 if=dev/buttons/event 2>/dev/null
+# a down
+
+while dd bs=12 count=1 if=dev/buttons/event 2>/dev/null; do :; done
+# a down
+# a up
+# b down
+# b up
+```
+
+For programs you write, `read(fd, buf, 12)` returns one event per call. See `ISSUES.md` for the underlying v9fs investigation.
+
+`cat` still works if you don't mind batching:
+
+```bash
+cat dev/buttons/event
+# (events appear ~16 at a time)
+```
+
+Polling levels remains a simple alternative:
 
 ```bash
 while true; do
@@ -285,14 +307,6 @@ while true; do
   echo -n "b="; cat dev/buttons/b
   sleep 0.05
 done
-```
-
-When fixed:
-
-```bash
-cat dev/buttons/event
-# a down
-# a up
 ```
 
 ---
@@ -658,5 +672,6 @@ echo 1 > sys/reboot
 - **Attach/walk** standard 9P2000; root fid walks `dev`, `sys`, `README`.
 - **Large reads:** use offset/count; `README` length is non-zero in stat (full doc size).
 - **Framebuffer** length is 64800 in stat.
-- **Do not** assume `buttons/event` or `mic/pcm` work without checking `cat dev/mic/ctl` / ISSUES.
+- **`buttons/event`** delivers per-event under small reads (`dd bs=12 count=1`) but batches under `cat` — kernel v9fs quirk, see ISSUES.
+- **Do not** assume `mic/pcm` works without checking `cat dev/mic/ctl` / ISSUES.
 - **Concurrent clients:** two sessions (TCP + WS) share device state; one global button event queue.

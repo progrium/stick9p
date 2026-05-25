@@ -27,7 +27,8 @@ pub const TSTAT: u8 = 124;
 pub const TWSTAT: u8 = 126;
 pub const TCREATE: u8 = 114;
 pub const TREMOVE: u8 = 122;
-pub const TFLUSH: u8 = 102;
+pub const TFLUSH: u8 = 108;
+pub const RFLUSH: u8 = 109;
 
 pub const NOFID: u32 = 0xffff_ffff;
 

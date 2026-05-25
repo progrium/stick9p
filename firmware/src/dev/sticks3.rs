@@ -396,10 +396,12 @@ async fn buttons_task(
         devices::buttons::set_a(a_down);
         devices::buttons::set_b(b_down);
         if a_down != prev_a {
+            esp_println::println!("btn: a {}", if a_down { "down" } else { "up" });
             devices::buttons::push_event('a', a_down);
             prev_a = a_down;
         }
         if b_down != prev_b {
+            esp_println::println!("btn: b {}", if b_down { "down" } else { "up" });
             devices::buttons::push_event('b', b_down);
             prev_b = b_down;
         }
