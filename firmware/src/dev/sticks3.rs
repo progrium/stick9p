@@ -55,6 +55,7 @@ pub fn spawn(
     i2s_bclk: esp_hal::peripherals::GPIO17<'static>,
     i2s_lrck: esp_hal::peripherals::GPIO15<'static>,
     i2s_dout: esp_hal::peripherals::GPIO14<'static>,
+    i2s_din: esp_hal::peripherals::GPIO16<'static>,
     i2c1: esp_hal::peripherals::I2C1<'static>,
     i2c1_sda: esp_hal::peripherals::GPIO9<'static>,
     i2c1_scl: esp_hal::peripherals::GPIO10<'static>,
@@ -78,7 +79,7 @@ pub fn spawn(
         display_task(spi2, lcd_mosi, lcd_sck, lcd_dc, lcd_cs, lcd_rst, lcd_bl).unwrap(),
     );
     spawner.spawn(
-        audio_task(i2s0, dma_i2s0, i2s_mclk, i2s_bclk, i2s_lrck, i2s_dout).unwrap(),
+        audio_task(i2s0, dma_i2s0, i2s_mclk, i2s_bclk, i2s_lrck, i2s_dout, i2s_din).unwrap(),
     );
 
     // External I²C bus 1 (Grove HY2.0 PORT.A: SDA=G9, SCL=G10). The bus is
@@ -265,11 +266,13 @@ async fn i2c_task(
                     data.acc.z as i32 * 4000 / 16384,
                 );
                 // Gyro raw is signed 16-bit at ±1000 dps full-scale.
-                // millidegrees-per-second = raw * 1000_000 / 32768 ≈ raw * 30.5.
+                // millidps = raw * 1_000_000 / 32768, but raw * 1_000_000 overflows
+                // i32 (max 32767 * 1_000_000 = 32.7e9 > 2.1e9). Use i64 for the
+                // intermediate multiply then truncate back to i32.
                 devices::imu::push_gyro(
-                    data.gyr.x as i32 * 1000000 / 32768,
-                    data.gyr.y as i32 * 1000000 / 32768,
-                    data.gyr.z as i32 * 1000000 / 32768,
+                    (data.gyr.x as i64 * 1_000_000 / 32768) as i32,
+                    (data.gyr.y as i64 * 1_000_000 / 32768) as i32,
+                    (data.gyr.z as i64 * 1_000_000 / 32768) as i32,
                 );
             }
         }
@@ -532,7 +535,7 @@ mod es8311_reg {
     pub const SYSTEM_11: u8 = 0x11;
     pub const SYSTEM_12: u8 = 0x12;
     pub const SYSTEM_13: u8 = 0x13;
-    pub const SYSTEM_14: u8 = 0x14;
+    pub const SYSTEM_14: u8 = 0x14; // = ADC_14 — same register, written once below
     pub const ADC_15: u8 = 0x15;
     pub const ADC_16: u8 = 0x16;
     pub const ADC_17: u8 = 0x17;
@@ -638,30 +641,49 @@ where
         // out of the AW8737. Clients can drop the software gain via
         // `/dev/spk/ctl gain <q8>` if needed.
         self.write(r::DAC_32, 0xB8)?;
-        println!("es8311: init ok (16 kHz mono, MCLK=4.096 MHz, slave)");
+
+        // ADC bring-up for the on-board MEMS mic.
+        // ADC_17: digital volume for the ADC/mic path.
+        // ES8311 scale appears to be 0x00 = mute, 0xFF = unity (0 dB).
+        // 0xBF ≈ −2.5 dB, 0x80 ≈ −6 dB, 0x40 ≈ −12 dB, 0x10 ≈ −24 dB.
+        // Start conservative at 0x40; raise toward 0x80/0xBF if quiet.
+        //
+        // Note: register 0x14 (SYSTEM_14 = ADC_14, same address) was already
+        // written above as part of the DAC bringup sequence (0x1A = MIC1
+        // single-ended input, 0 dB PGA). Do NOT write it again here.
+        self.write(r::ADC_17, 0x80)?;
+
+        println!("es8311: init ok (16 kHz mono, MCLK=4.096 MHz, slave, mic enabled)");
         Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// I²S TX audio path: drives the ES8311 DAC at 16 kHz / 16-bit stereo
-// (mono content duplicated to both slots).
+// I²S audio path — full-duplex against the ES8311 codec.
 //
-// MCLK=G18, BCLK=G17, LRCK=G15, DOUT=G14; DIN=G16 left unused for now (mic).
+// MCLK=G18, BCLK=G17, LRCK=G15, DOUT=G14, DIN=G16 — shared clock signals
+// between the TX (DAC, → /dev/spk) and RX (ADC, ← /dev/mic) halves.
 //
-// Uses **circular DMA** via `dma_circular_buffers!` so BCLK never stops —
-// avoids the inter-chunk clicks/tremolo of one-shot transfers. The DMA
-// keeps reading from a 4 KiB stereo ring at 16 kHz/256 = 16 KiB/s per
-// channel = 64 KiB/s total, and `push_with` refills it from either the
-// boot fanfare mono buffer or `/dev/spk/pcm` mono samples. Mono → stereo
-// expansion + software gain happens inside the closure so the DMA buffer
-// is never silent unless intentional.
+// **Circular DMA both directions** via `dma_circular_buffers!(rx, tx)` so
+// BCLK never stops. The TX half feeds the AW8737 amp through the same
+// boot-fanfare / spk-ring fill_chunk path as before; the RX half drains
+// the ES8311 ADC into `devices::mic::push_pcm`. Both halves share the
+// same I²S0 unit so the WS/BCLK clocks line up — full duplex is just two
+// independent DMA streams running over one I²S peripheral.
 //
-// Buffer alignment matters: `dma_circular_buffers!` lays out a static
-// `[u32; N/4]` so the DMA controller gets word-aligned reads. An earlier
-// `Box::leak` approach with a `Vec<u8>` wedged the chip because heap
-// allocations are byte-aligned and circular reads at high rate require
-// word alignment on ESP32-S3.
+// The two halves are driven concurrently by `embassy_futures::join!`.
+// The TX side uses `push_with`, the RX side uses `available`/`pop` (same
+// pattern as Plus2 PDM mic). Mono I²S input on the ES8311 still travels
+// as a 16-bit stereo frame on the wire (same as TX); we downmix to mono
+// by taking the left slot before pushing into the mic ring so 9P clients
+// get the format they're promised (`fmt=s16le ch=1`).
+//
+// Buffer alignment matters: `dma_circular_buffers!` lays out static
+// `[u32; …]` arrays so the DMA controller gets word-aligned reads.
+// **TX ring size must be a multiple of 12** (see DMA_RING_BYTES below);
+// the RX side has no such constraint with current esp-hal but we keep
+// the RX size on a 4-byte boundary anyway so per-frame slices land
+// cleanly.
 // ---------------------------------------------------------------------------
 
 const SAMPLE_RATE_HZ: u32 = 16000;
@@ -676,7 +698,7 @@ const FANFARE_TOTAL_MS: u32 = FANFARE_TONE_A_MS + FANFARE_GAP_MS + FANFARE_TONE_
 const FANFARE_FRAMES: usize = (SAMPLE_RATE_HZ as usize) * (FANFARE_TOTAL_MS as usize) / 1000;
 const FANFARE_MONO_BYTES: usize = FANFARE_FRAMES * 2;
 
-/// Circular DMA ring size in bytes (stereo s16le).
+/// TX circular DMA ring size in bytes (stereo s16le).
 ///
 /// **Must be a multiple of 12** so that esp-hal's circular split (3
 /// descriptors of `len/3 + len%3` bytes when `len ≤ chunk_size*2`) lands on
@@ -685,9 +707,21 @@ const FANFARE_MONO_BYTES: usize = FANFARE_FRAMES * 2;
 /// hand back slices that begin mid-frame, which scrambles L/R into a loud
 /// metallic high-frequency aliasing tone.
 const DMA_RING_BYTES: usize = 6144;
+/// RX circular DMA ring size in bytes (stereo s16le). 6144 ≈ 96 ms @
+/// 16 kHz, plenty of slack between ADC fills so the 9P side can be slow
+/// to consume without dropping samples.
+const RX_DMA_BYTES: usize = 6144;
 /// Scratch for one mono drain from the spk ring. 512 bytes = 256 samples =
 /// 16 ms — plenty smaller than the DMA ring so push_with isn't starved.
 const MONO_SCRATCH_BYTES: usize = 512;
+/// Scratch for one ADC drain. **Must be ≥ `RX_DMA_BYTES`**:
+/// `RxCircularState::pop` in esp-hal 1.1 returns `BufferTooSmall`
+/// whenever `available > data.len()` (it refuses to consume partial
+/// data), so the scratch has to fit the worst-case fill — all three
+/// descriptors at once — or the very first overrun aborts the RX
+/// future. Matches the DMA ring exactly; the mono downmix buffer
+/// below is half-sized since stereo → mono drops every other word.
+const RX_SCRATCH_BYTES: usize = RX_DMA_BYTES;
 
 /// Audio task state captured outside the closure so push_with can mutate
 /// fanfare position across iterations without borrowing self twice.
@@ -721,11 +755,19 @@ async fn audio_task(
     bclk: esp_hal::peripherals::GPIO17<'static>,
     lrck: esp_hal::peripherals::GPIO15<'static>,
     dout: esp_hal::peripherals::GPIO14<'static>,
+    din: esp_hal::peripherals::GPIO16<'static>,
 ) {
+    use devices::mic;
     use esp_hal::i2s::master::{Config as I2sConfig, DataFormat, I2s};
     use esp_hal::time::Rate;
 
     AUDIO_READY.wait().await;
+
+    // Reflect the *actual* hardware-locked rate in `cat /dev/mic/ctl`
+    // — the ES8311 + I²S OSR pin us to 16 kHz; the devices::mic static
+    // default (44.1 kHz, from the Plus2 PDM path) would otherwise lie
+    // to clients sizing capture buffers.
+    mic::set_rate_hz(SAMPLE_RATE_HZ);
 
     let cfg = I2sConfig::new_tdm_philips()
         .with_sample_rate(Rate::from_hz(SAMPLE_RATE_HZ))
@@ -739,9 +781,12 @@ async fn audio_task(
         }
     };
 
-    // Properly-aligned static buffer + circular descriptor chain.
-    let (_rx_buf, _rx_desc, tx_buffer, tx_descriptors) =
-        esp_hal::dma_circular_buffers!(0, DMA_RING_BYTES);
+    // Both directions get word-aligned static buffers + circular
+    // descriptor chains. Sharing one `dma_circular_buffers!` call keeps
+    // RX and TX descriptors out of the same descriptor block so neither
+    // side stomps the other when refilled concurrently.
+    let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
+        esp_hal::dma_circular_buffers!(RX_DMA_BYTES, DMA_RING_BYTES);
 
     let tx = i2s
         .i2s_tx
@@ -749,18 +794,100 @@ async fn audio_task(
         .with_ws(lrck)
         .with_dout(dout)
         .build(tx_descriptors);
+    // Both halves of the same I²S peripheral share BCLK/LRCK in
+    // full-duplex; only the RX-specific data pin needs declaring here.
+    let rx = i2s.i2s_rx.with_din(din).build(rx_descriptors);
 
-    let mut circ = match tx.write_dma_circular_async(tx_buffer) {
+    let mut tx_circ = match tx.write_dma_circular_async(tx_buffer) {
         Ok(c) => c,
         Err(e) => {
-            println!("i2s: circular dma err {:?}", e);
+            println!("i2s: circular tx dma err {:?}", e);
             return;
         }
     };
+
+    // ---- Defer RX startup ----
+    //
+    // The 6 KB RX ring holds ~96 ms of stereo audio at 16 kHz. Other
+    // boot-time tasks (display ST7789P3 init, WiFi assoc) routinely
+    // stall the embassy executor for longer than that, which means
+    // the very first descriptor cycle of RX DMA gets overwritten
+    // before we can drain it → `DmaError::Late` permanently corrupts
+    // `RxCircularState` and esp-hal 1.1 exposes no way to reset it.
+    //
+    // Waiting 2 s lets the system settle (display init + WiFi assoc
+    // typically finish within ~1 s) so RX comes up into a quiescent
+    // executor and stays caught up. TX is already streaming silence
+    // through the spk ring during the wait, so the codec keeps its
+    // BCLK lock the whole time.
+    Timer::after(Duration::from_millis(2000)).await;
+    println!("audio: starting RX DMA after boot settle");
+
+    let mut rx_circ = match rx.read_dma_circular_async(rx_buffer) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("i2s: circular rx dma err {:?}", e);
+            return;
+        }
+    };
+
+    // ---- esp-hal 1.1 full-duplex RX workaround ----
+    //
+    // `read_dma_circular_async` does `reset_rx` → `rx_start`, but on
+    // ESP32-S3 `rx_reset` wipes the slot/word-length config out of the
+    // I²S RX clock domain. The conf registers in APB-land still hold
+    // the right values, but they only take effect after pulsing
+    // `RX_UPDATE` (`I2S_RX_CONF_REG[8]`). Without that re-latch, the
+    // RX serializer runs with an empty slot config and never clocks
+    // any bits into the FIFO → DMA descriptors never complete →
+    // `available().await` blocks forever (`rx_seen=0` symptom).
+    //
+    // Per the nuttx fix in PR #18622 ("fix I2S RX DMA path for ESP32-S3"),
+    // `rx_update` only applies cleanly while `rx_start` is low. esp-hal
+    // already set `rx_start` inside `read_dma_circular_async`, so we have
+    // to stop → latch → restart. The DMA descriptor chain is unaffected
+    // by this (we don't touch the DMA channel, only the I²S RX engine's
+    // start bit), so the chain picks up at the next BCLK after restart.
+    //
+    // ESP32-S3 I²S0 base = 0x6000_F000, RX_CONF = +0x20.
+    // Bit layout: RX_RESET=0, RX_FIFO_RESET=1, RX_START=2 (low-bits
+    // matter — see esp32s3 PAC), RX_UPDATE=8.
+    unsafe {
+        const RX_CONF: *mut u32 = 0x6000_F020 as *mut u32;
+        const RX_START_BIT: u32 = 1 << 2;
+        const RX_UPDATE_BIT: u32 = 1 << 8;
+
+        // 1. stop RX so the update bit will be honoured
+        let mut v = core::ptr::read_volatile(RX_CONF);
+        core::ptr::write_volatile(RX_CONF, v & !RX_START_BIT);
+
+        // 2. pulse RX_UPDATE — copies APB conf → I²S RX clock domain
+        v = core::ptr::read_volatile(RX_CONF);
+        core::ptr::write_volatile(RX_CONF, v | RX_UPDATE_BIT);
+        let mut spin = 0u32;
+        while (core::ptr::read_volatile(RX_CONF) & RX_UPDATE_BIT) != 0 {
+            spin += 1;
+            if spin > 100_000 {
+                println!("i2s: rx_update bit didn't auto-clear");
+                break;
+            }
+        }
+
+        // 3. restart RX with the freshly latched slot config
+        v = core::ptr::read_volatile(RX_CONF);
+        core::ptr::write_volatile(RX_CONF, v | RX_START_BIT);
+
+        println!(
+            "i2s: rx_update applied, rx_conf=0x{:08x}",
+            core::ptr::read_volatile(RX_CONF),
+        );
+    }
+
     println!(
-        "audio: I²S circular DMA running ({} kHz, ring {} B)",
+        "audio: I²S full-duplex DMA running ({} kHz, tx ring {} B, rx ring {} B)",
         SAMPLE_RATE_HZ / 1000,
         DMA_RING_BYTES,
+        RX_DMA_BYTES,
     );
 
     let fanfare_mono: &'static [u8] = Box::leak(build_fanfare_mono_buffer());
@@ -771,13 +898,96 @@ async fn audio_task(
         held_pending: false,
     };
 
-    loop {
-        let res = circ.push_with(|dma_slice| state.fill_chunk(dma_slice)).await;
-        if let Err(e) = res {
-            println!("audio: push err {:?}", e);
-            return;
+    let tx_fut = async {
+        loop {
+            if let Err(e) = tx_circ
+                .push_with(|dma_slice| state.fill_chunk(dma_slice))
+                .await
+            {
+                println!("audio: tx push err {:?}", e);
+                return;
+            }
         }
-    }
+    };
+
+    // RX scratch + mono downmix buffer must be the full DMA ring size
+    // (~6 KB / ~3 KB — see `RX_SCRATCH_BYTES`). Putting them on the
+    // task stack would blow the embassy task stack budget, and the heap
+    // is too small for two multi-KB allocations once the rest of the
+    // firmware is up. Park them in BSS instead via local `static mut`
+    // (audio_task only runs once, so taking exclusive `&mut` is sound).
+    let scratch: &'static mut [u8; RX_SCRATCH_BYTES] = {
+        static mut SCRATCH: [u8; RX_SCRATCH_BYTES] = [0; RX_SCRATCH_BYTES];
+        #[allow(static_mut_refs)]
+        unsafe { &mut SCRATCH }
+    };
+    let mono: &'static mut [u8; RX_SCRATCH_BYTES / 2] = {
+        static mut MONO: [u8; RX_SCRATCH_BYTES / 2] = [0; RX_SCRATCH_BYTES / 2];
+        #[allow(static_mut_refs)]
+        unsafe { &mut MONO }
+    };
+
+    let rx_fut = async {
+        println!("mic: rx loop entered");
+        let mut last_err_log_ms: u64 = 0;
+        loop {
+            mic::note_rx_poll();
+            let avail = match rx_circ.available().await {
+                Ok(n) => n,
+                Err(e) => {
+                    // `DmaError::Late` fires when one or more circular
+                    // descriptors got rewritten before we drained them
+                    // (e.g. display SPI init or WiFi pinned the executor
+                    // for >96 ms at startup). The DMA controller keeps
+                    // running — we just lost a chunk of samples. Skip
+                    // and continue rather than abandoning capture.
+                    let now = Instant::now().as_millis();
+                    if now.saturating_sub(last_err_log_ms) > 1000 {
+                        println!("mic: rx avail err {:?} (continuing)", e);
+                        last_err_log_ms = now;
+                    }
+                    continue;
+                }
+            };
+            if avail == 0 {
+                continue;
+            }
+            // Drain in stereo-frame multiples so the L/R split below
+            // doesn't tear samples in half.
+            let want = (avail.min(scratch.len())) & !0x3;
+            if want == 0 {
+                continue;
+            }
+            let got = match rx_circ.pop(&mut scratch[..want]).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let now = Instant::now().as_millis();
+                    if now.saturating_sub(last_err_log_ms) > 1000 {
+                        println!("mic: rx pop err {:?} (continuing)", e);
+                        last_err_log_ms = now;
+                    }
+                    continue;
+                }
+            };
+            // Always note the raw RX byte count — that's the diagnostic
+            // for "DMA is alive" vs "codec mute" vs "audio task stuck".
+            mic::note_rx_seen(got);
+            if got == 0 || !mic::is_running() {
+                continue;
+            }
+            // ES8311 ADC is mono; it outputs its sample in the LEFT (WS-low)
+            // slot. Each 4-byte I²S RX frame: bytes 0,1 = left (s16le),
+            // bytes 2,3 = right (s16le, zeros/same). Take left only.
+            let frames = got / 4;
+            for f in 0..frames {
+                mono[f * 2] = scratch[f * 4];
+                mono[f * 2 + 1] = scratch[f * 4 + 1];
+            }
+            mic::push_pcm(&mono[..frames * 2]);
+        }
+    };
+
+    embassy_futures::join::join(tx_fut, rx_fut).await;
 }
 
 impl AudioState {

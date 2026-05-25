@@ -103,6 +103,7 @@ async fn main(spawner: Spawner) -> ! {
             peripherals.GPIO17,
             peripherals.GPIO15,
             peripherals.GPIO14,
+            peripherals.GPIO16,
             peripherals.I2C1,
             peripherals.GPIO9,
             peripherals.GPIO10,

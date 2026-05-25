@@ -86,6 +86,7 @@ where
                     PendingKind::MicPcm => mic::try_read_pcm(0, buf),
                 };
                 if n > 0 {
+                    ninep_log!("9p: pend-drain {} bytes (tag={})", n, p.tag);
                     let reply_len = build_read_reply(&mut self.storage.tx, p.tag, &buf[..n]);
                     if write_all(&mut self.stream, &self.storage.tx[..reply_len])
                         .await
@@ -486,6 +487,12 @@ where
             fs::read_file(node, &self.ctx, offset, data)
         };
         let n = n.min(max_count);
+        if node == Node::DevMicPcm {
+            ninep_log!(
+                "9p: Tread mic/pcm tag={} off={} count={} max={} got={} running={}",
+                tag, offset, count, max_count, n, mic::is_running()
+            );
+        }
         if node == Node::DevBtnEvent && offset == 0 && n == 0 {
             return Ok(DispatchResult::WaitStream {
                 kind: PendingKind::BtnEvent,
@@ -494,6 +501,7 @@ where
             });
         }
         if node == Node::DevMicPcm && n == 0 && mic::is_running() {
+            ninep_log!("9p: WaitStream MicPcm tag={} count={}", tag, count);
             return Ok(DispatchResult::WaitStream {
                 kind: PendingKind::MicPcm,
                 tag,
@@ -692,7 +700,14 @@ async fn flush_stream<S: Write>(s: &mut S) -> Result<(), ()> {
     s.flush().await.map_err(|_| ())
 }
 
-/// Read one 9P message. `timeout_ms == 0` blocks until a full packet arrives.
+/// Read one 9P message.
+///
+/// `timeout_ms == 0` blocks until a full packet arrives.
+/// Non-zero `timeout_ms` *only* bounds the wait for the message's first byte
+/// (the header); once a header arrives, the body is read with no timeout so a
+/// streaming write from the client doesn't desynchronise us. The header-only
+/// timeout is what `Session::run` uses to periodically re-poll
+/// `pending_stream` while waiting on slow producers like the mic ring.
 async fn read_packet<S: Read>(
     s: &mut S,
     work: &mut [u8],
@@ -702,7 +717,7 @@ async fn read_packet<S: Read>(
     let mut hdr = [0u8; 4];
     if timeout_ms == 0 {
         read_exact(s, &mut hdr).await?;
-    } else if !read_until_deadline(s, &mut hdr, timeout_ms).await? {
+    } else if !read_first_byte_until_deadline(s, &mut hdr, timeout_ms).await? {
         return Ok(None);
     }
     let size = u32::from_le_bytes(hdr) as usize;
@@ -710,29 +725,44 @@ async fn read_packet<S: Read>(
         return Err(());
     }
     work[..4].copy_from_slice(&hdr);
-    if timeout_ms == 0 {
-        read_exact(s, &mut work[4..size]).await?;
-    } else if !read_until_deadline(s, &mut work[4..size], timeout_ms).await? {
-        return Err(());
-    }
+    read_exact(s, &mut work[4..size]).await?;
     Ok(Some(size))
 }
 
-async fn read_until_deadline<S: Read>(s: &mut S, buf: &mut [u8], timeout_ms: u64) -> Result<bool, ()> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut pos = 0usize;
-    while pos < buf.len() {
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        let n = s.read(&mut buf[pos..]).await.map_err(|_| ())?;
-        if n == 0 {
-            return Err(());
-        }
-        pos += n;
-        if pos < buf.len() {
-            Timer::after(Duration::from_millis(2)).await;
-        }
+/// Wait up to `timeout_ms` for the first byte of a new 9P message, then drain
+/// the rest of `buf` without further timeouts.
+///
+/// The old "check deadline → await s.read()" loop deadlocked streaming reads
+/// (e.g. `dd if=/dev/mic/pcm`): once the session task was sleeping inside
+/// `s.read().await` waiting for the next Tread, the audio task could keep
+/// calling `mic::push_pcm` indefinitely without ever waking us, so the
+/// pending Rread was never sent. Racing the *first* read against a real
+/// timer lets `Session::run` re-poll the ring (or any other synthetic
+/// stream) on a wall-clock schedule instead of "next inbound TCP byte".
+///
+/// Returns `Ok(true)` if the full buffer was filled, `Ok(false)` if the
+/// deadline expired before any bytes arrived (no partial read), or `Err(())`
+/// on socket error / EOF.
+async fn read_first_byte_until_deadline<S: Read>(
+    s: &mut S,
+    buf: &mut [u8],
+    timeout_ms: u64,
+) -> Result<bool, ()> {
+    use embassy_futures::select::{select, Either};
+    let timer_fut = Timer::after(Duration::from_millis(timeout_ms));
+    let read_fut = s.read(buf);
+    let n = match select(read_fut, timer_fut).await {
+        Either::First(Ok(0)) => return Err(()),
+        Either::First(Ok(n)) => n,
+        Either::First(Err(_)) => return Err(()),
+        // Timer beat the read. Critically, embedded-io-async's contract for
+        // dropping a pending read is implementation-defined; for embassy-net
+        // TcpSocket it's safe (the future just stops being polled). No bytes
+        // were consumed because the kernel pump only delivered them on poll.
+        Either::Second(()) => return Ok(false),
+    };
+    if n < buf.len() {
+        read_exact(s, &mut buf[n..]).await?;
     }
     Ok(true)
 }
