@@ -5,7 +5,7 @@ use esp_println::println;
 use ninep::fs::FsContext;
 use ninep::server::Session;
 
-use crate::board::{BOARD_NAME, FW_VERSION};
+use crate::board::{sys_info, BOARD_NAME, FW_VERSION};
 use crate::net::buffers;
 use devices::{buttons, buzzer, display, imu, led, mic, power, spk};
 
@@ -19,6 +19,9 @@ fn fs_context() -> FsContext<'static> {
         board_name: BOARD_NAME,
         version: FW_VERSION,
         uptime_ms: || embassy_time::Instant::now().as_millis(),
+        sys_mac_line: sys_info::mac_line,
+        sys_chip_line: sys_info::chip_line,
+        sys_heap_line: sys_info::heap_line,
         led_state_line: led::state_line,
         on_led_ctl: |s| led::handle_ctl(s).map_err(|_| "bad ctl"),
         request_reboot: || {
@@ -101,6 +104,8 @@ pub async fn ninep_tcp_server(stack: Stack<'static>) {
         let mut socket = TcpSocket::new(stack, &mut bufs.rx, &mut bufs.tx);
         socket.set_timeout(None);
         println!("9p: waiting tcp/{}", TCP_9P_PORT);
+        #[cfg(feature = "board-sticks3")]
+        crate::boot_gate::mark_subsystem_ready(crate::boot_gate::SUBSYS_NET9P);
         match socket
             .accept(IpListenEndpoint {
                 addr: None,

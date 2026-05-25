@@ -1,6 +1,6 @@
 # stick9p — M5Stack Stick 9P file server
 
-Plan 9–style filesystem over **9P2000** on **M5StickC Plus2** (default) and **StickS3** (planned). Firmware is `no_std` Rust on **esp-hal 1.x** + **Embassy**: Wi‑Fi provisioning, TCP **564**, WebSocket **8080**, and a static device tree wired through `ninep::fs` + `devices/*`.
+Plan 9–style filesystem over **9P2000** on **M5StickC Plus2** (default) and **M5Stack StickS3**. Firmware is `no_std` Rust on **esp-hal 1.x** + **Embassy**: Wi‑Fi provisioning, TCP **564**, WebSocket **8080**, and a static device tree wired through `ninep::fs` + `devices/*`.
 
 Full architecture and hardware targets: [DESIGN.md](DESIGN.md). Open bugs: [ISSUES.md](ISSUES.md).
 
@@ -11,10 +11,10 @@ Full architecture and hardware targets: [DESIGN.md](DESIGN.md). Open bugs: [ISSU
 | Wi‑Fi captive portal + NVS STA | Works |
 | 9P TCP `:564` / WS `:8080` | Works |
 | LED, display, IMU, buttons (levels), power, buzzer | Works |
-| `/dev/buttons/event` | Broken — see [ISSUES.md](ISSUES.md) |
+| `/dev/buttons/event` | Works; `cat` batches ~16 events (kernel quirk) — [ISSUES.md](ISSUES.md) |
 | `/dev/display/brightness` | On/off only — dimming deferred |
 | `/dev/mic/pcm` | Tree + ctl present; **no capture** (`queued=0`) — [ISSUES.md](ISSUES.md) |
-| StickS3 (`board-sticks3`) | Wi‑Fi + 9P + ST7789P3 display, BMI270 IMU (`/dev/imu/{accel,gyro}`, ±4 g / ±1000 dps / 100 Hz), buttons G11/G12, M5PM1 VBAT (`/dev/power/{battery,vbat_mv}`), ES8311 + AW8737 boot fanfare, **`/dev/spk/{ctl,pcm,info}` streaming** (mono s16le @ 16 kHz, circular I²S DMA, software gain). `/dev/led/*` no‑op on hardware ([ISSUES.md](ISSUES.md)); mic capture deferred (same gap as Plus2) |
+| StickS3 (`board-sticks3`) | Wi‑Fi + 9P + ST7789P3 display, BMI270 IMU, buttons G11/G12, M5PM1 VBAT, ES8311 + AW8737 **boot fanfare** (staggered bring-up — [ISSUES.md](ISSUES.md)), **`/dev/spk/{ctl,pcm,info}`** + **`/dev/mic/{ctl,pcm}`** @ 16 kHz, `/dev/i2c/1`, `/dev/gpio/1..8`, `/sys/heap`. `/dev/led/*` no‑op ([ISSUES.md](ISSUES.md)) |
 
 Firmware version string: `stick9p-0.4.0-stage3-spk` (`cat /mnt/stick/sys/version`).
 
@@ -101,13 +101,14 @@ Use **`msize=4096`** (server caps negotiated size to fit Plus2 buffers). Reads l
     ├── led/ctl, state
     ├── display/ctl, brightness, fb, info
     ├── imu/ctl, accel, gyro      # MPU6886
-    ├── buttons/a, b, event, ctl  # event: broken — ISSUES.md
+    ├── buttons/a, b, event, ctl  # event: batched under cat — ISSUES.md
     ├── power/ctl, battery, vbat_mv
     ├── buzzer/ctl
     └── mic/ctl, pcm              # pcm: not capturing — ISSUES.md
+
 ```
 
-Not on Plus2: `/dev/spk`, IR, M5PM1 power rails, StickS3-only nodes (see DESIGN §6). On StickS3 the tree adds `dev/spk/{ctl,pcm,info}` — see [USAGE.md](USAGE.md#devspkctl-sticks3-only).
+Not on Plus2: `/dev/spk`, IR, M5PM1 power rails, StickS3-only nodes (see DESIGN §6). On StickS3 the tree adds `dev/spk/{ctl,pcm,info}`, `dev/mic/{ctl,pcm}`, `dev/i2c/1`, `dev/gpio/1..8`, `sys/heap` — see [USAGE.md](USAGE.md).
 
 ### Examples
 

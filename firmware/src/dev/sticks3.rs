@@ -30,11 +30,6 @@ use devices::{buzzer, display, spk};
 /// task only drives SPI once the panel's analog supply is live.
 static L3B_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// Signalled by the I²C task after ES8311 has been programmed and the AW8737
-/// amp has been enabled, so the audio task only starts I²S DMA once the codec
-/// is ready to receive samples.
-static AUDIO_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-
 pub fn spawn(
     spawner: &Spawner,
     i2c0: esp_hal::peripherals::I2C0<'static>,
@@ -105,11 +100,6 @@ pub fn spawn(
     crate::dev::gpio::install_pin(6, Flex::new(gpio6));
     crate::dev::gpio::install_pin(7, Flex::new(gpio7));
     crate::dev::gpio::install_pin(8, Flex::new(gpio8));
-
-    // Once the audio path is up we want the boot fanfare to fire (same two-beep
-    // pattern as Plus2 — sequenced through `buzzer::take_done_fanfare` so the
-    // 9P /dev/buzzer/ctl surface keeps working uniformly across boards).
-    buzzer::request_stage2_done();
 }
 
 // ---------------------------------------------------------------------------
@@ -159,50 +149,22 @@ async fn i2c_task(
         .with_scl(scl);
     let i2c_cell = RefCell::new(i2c_raw);
 
-    // --- M5PM1: identify + enable L3B rail (gates LCD BL, mic, spk) -------
+    // --- M5PM1 + BMI270 only: keep L3B/codec/amp off during WiFi (RF peak). -
     let mut pm = M5Pm1 {
         i2c: RefCellDevice::new(&i2c_cell),
     };
     if pm.init().is_err() {
         println!("m5pm1: init failed");
     }
-    if pm.enable_l3b().is_err() {
-        println!("m5pm1: L3B enable failed (LCD/mic/spk may stay off)");
-    } else {
-        println!("m5pm1: L3B rail enabled (LCD BL / mic / spk)");
-    }
-    L3B_READY.signal(());
 
-    // --- BMI270: chip-id + 8 KB config blob upload + ACC/GYR enable ------
+    // --- BMI270: 8 KB config upload before WiFi (main waits `devices_ready`). -
     let mut bmi = Bmi2::<_, _, 512>::new_i2c(
         RefCellDevice::new(&i2c_cell),
         EmbDelay,
         I2cAddr::Default,
         Burst::new(255),
     );
-    // --- ES8311 (audio codec on the same I²C bus, 0x18) -------------------
-    let mut es = Es8311 {
-        i2c: RefCellDevice::new(&i2c_cell),
-    };
-    let audio_ok = match es.init_16k_mono_from_mclk() {
-        Ok(()) => {
-            // Plain GPIO high on M5PM1 PYG3 enables the AW8737 amp rail.
-            if pm.enable_spk_amp().is_err() {
-                println!("m5pm1: SPK amp enable failed");
-            } else {
-                println!("m5pm1: AW8737 amp enabled (PYG3 high)");
-            }
-            AUDIO_READY.signal(());
-            true
-        }
-        Err(_) => {
-            println!("es8311: init failed");
-            false
-        }
-    };
-    let _ = audio_ok;
-
-    // --- BMI270 ------------------------------------------------------------
+    Timer::after(Duration::from_millis(20)).await;
     let imu_ok = match bmi.get_chip_id() {
         Ok(id) => {
             println!("bmi270: CHIP_ID={:#04x} (expect 0x24)", id);
@@ -247,12 +209,54 @@ async fn i2c_task(
         }
     };
 
+    Timer::after(Duration::from_millis(30)).await;
+
+    println!("boot: devices ready (PMIC+IMU, no L3B/codec/amp)");
+    crate::boot_gate::signal_devices_ready();
+
+    // WiFi runs in `main` until DHCP; then L3B + codec (amp still off).
+    crate::boot_gate::wait_network_ready().await;
+
+    if pm.enable_l3b().is_err() {
+        println!("m5pm1: L3B enable failed (LCD/mic/spk may stay off)");
+    } else {
+        println!("m5pm1: L3B rail enabled (LCD BL / mic / spk)");
+    }
+    Timer::after(Duration::from_millis(50)).await;
+    L3B_READY.signal(());
+
+    let mut es = Es8311 {
+        i2c: RefCellDevice::new(&i2c_cell),
+    };
+    match es.init_16k_mono_from_mclk() {
+        Ok(()) => {
+            Timer::after(Duration::from_millis(20)).await;
+            println!("es8311: programmed (amp off until fanfare)");
+        }
+        Err(_) => println!("es8311: init failed"),
+    }
+    crate::boot_gate::mark_subsystem_ready(crate::boot_gate::SUBSYS_CODEC);
+
+    let mut amp_on = false;
+
     // --- Steady-state poll: IMU at requested rate, VBAT once per second ---
     // Use Option<Instant> so the first iteration always reads VBAT (rather
     // than relying on Instant::now() − some duration, which underflows at
     // boot before 5 s have actually elapsed).
     let mut last_vbat: Option<Instant> = None;
     loop {
+        if !amp_on && crate::boot_gate::boot_is_done() {
+            amp_on = true;
+            // Unmute DAC (init left DAC_32 at 0x00) then enable AW8737.
+            let _ = es.write(es8311_reg::DAC_32, 0xB8);
+            if pm.enable_spk_amp().is_err() {
+                println!("m5pm1: SPK amp enable failed");
+            } else {
+                println!("m5pm1: AW8737 amp enabled for fanfare");
+                crate::boot_gate::signal_amp_ready();
+            }
+        }
+
         let hz = devices::imu::rate_hz().max(1) as u64;
         let period_ms = (1000 / hz).max(2);
 
@@ -444,6 +448,7 @@ async fn display_task(
     let rst_pin = Output::new(rst, Level::High, OutputConfig::default());
     let mut bl_pin = Output::new(bl, Level::Low, OutputConfig::default());
 
+    // L3B is enabled only after WiFi DHCP in `i2c_task`.
     L3B_READY.wait().await;
     Timer::after(Duration::from_millis(50)).await;
     bl_pin.set_high();
@@ -472,6 +477,7 @@ async fn display_task(
         .expect("lcd init");
 
     println!("display: ST7789P3 ok (CS=G41 RST=G21 BL=G38)");
+    crate::boot_gate::mark_subsystem_ready(crate::boot_gate::SUBSYS_DISPLAY);
 
     loop {
         let on = devices::display::is_on();
@@ -642,7 +648,8 @@ where
         // −2 dB) so a software gain of 256 (unity) is already audibly loud
         // out of the AW8737. Clients can drop the software gain via
         // `/dev/spk/ctl gain <q8>` if needed.
-        self.write(r::DAC_32, 0xB8)?;
+        // DAC muted until fanfare (`i2c_task` sets 0xB8 when amp comes up).
+        self.write(r::DAC_32, 0x00)?;
 
         // ADC bring-up for the on-board MEMS mic.
         // ADC_17: digital volume for the ADC/mic path.
@@ -763,7 +770,16 @@ async fn audio_task(
     use esp_hal::i2s::master::{Config as I2sConfig, DataFormat, I2s};
     use esp_hal::time::Rate;
 
-    AUDIO_READY.wait().await;
+    // Allocate fanfare PCM before any await so I²S bring-up doesn't also hit the heap.
+    let fanfare_mono: &'static [u8] = Box::leak(build_fanfare_mono_buffer());
+
+    // No I²S / amp until codec + display + 9P are up and amp is enabled.
+    crate::boot_gate::wait_boot_complete().await;
+    println!("audio: boot complete, waiting for amp");
+    crate::boot_gate::wait_amp_ready().await;
+    // Let AW8737 + ES8311 unmute settle before MCLK/BCLK start (reduces inrush + USB glitch).
+    Timer::after(Duration::from_millis(120)).await;
+    println!("audio: amp ready, starting I²S");
 
     // Reflect the *actual* hardware-locked rate in `cat /dev/mic/ctl`
     // — the ES8311 + I²S OSR pin us to 16 kHz; the devices::mic static
@@ -782,6 +798,7 @@ async fn audio_task(
             return;
         }
     };
+    println!("i2s: master ok");
 
     // Both directions get word-aligned static buffers + circular
     // descriptor chains. Sharing one `dma_circular_buffers!` call keeps
@@ -789,6 +806,7 @@ async fn audio_task(
     // side stomps the other when refilled concurrently.
     let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
         esp_hal::dma_circular_buffers!(RX_DMA_BYTES, DMA_RING_BYTES);
+    println!("i2s: dma buffers ok");
 
     let tx = i2s
         .i2s_tx
@@ -808,32 +826,35 @@ async fn audio_task(
         }
     };
 
-    // ---- Defer RX startup ----
-    //
-    // The 6 KB RX ring holds ~96 ms of stereo audio at 16 kHz. Other
-    // boot-time tasks (display ST7789P3 init, WiFi assoc) routinely
-    // stall the embassy executor for longer than that, which means
-    // the very first descriptor cycle of RX DMA gets overwritten
-    // before we can drain it → `DmaError::Late` permanently corrupts
-    // `RxCircularState` and esp-hal 1.1 exposes no way to reset it.
-    //
-    // Waiting 2 s lets the system settle (display init + WiFi assoc
-    // typically finish within ~1 s) so RX comes up into a quiescent
-    // executor and stays caught up. TX is already streaming silence
-    // through the spk ring during the wait, so the codec keeps its
-    // BCLK lock the whole time.
-    Timer::after(Duration::from_millis(2000)).await;
-    println!("audio: starting RX DMA after boot settle");
-
-    let mut rx_circ = match rx.read_dma_circular_async(rx_buffer) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("i2s: circular rx dma err {:?}", e);
-            return;
-        }
+    let mut state = AudioState {
+        fanfare_mono,
+        fanfare_pos: Some(0),
+        last_sample: 0,
+        held_pending: false,
     };
+    println!("audio: TX DMA starting (boot fanfare)");
 
-    // ---- esp-hal 1.1 full-duplex RX workaround ----
+    // ---- Defer RX startup (TX runs in parallel via join below) ----
+    //
+    // The 6 KB RX ring holds ~96 ms of stereo audio at 16 kHz. If RX
+    // starts while display SPI or WiFi still monopolize the executor,
+    // the first descriptor cycle can be overwritten → `DmaError::Late`.
+    // TX must run during the settle delay so BCLK stays locked *and* the
+    // boot fanfare actually plays (request_stage2_done is consumed in
+    // fill_chunk, which only runs once push_with is active).
+    let rx_fut = async {
+        Timer::after(Duration::from_millis(800)).await;
+        println!("audio: starting RX DMA after boot settle");
+
+        let mut rx_circ = match rx.read_dma_circular_async(rx_buffer) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("i2s: circular rx dma err {:?}", e);
+                return;
+            }
+        };
+
+        // ---- esp-hal 1.1 full-duplex RX workaround ----
     //
     // `read_dma_circular_async` does `reset_rx` → `rx_start`, but on
     // ESP32-S3 `rx_reset` wipes the slot/word-length config out of the
@@ -878,58 +899,31 @@ async fn audio_task(
         // 3. restart RX with the freshly latched slot config
         v = core::ptr::read_volatile(RX_CONF);
         core::ptr::write_volatile(RX_CONF, v | RX_START_BIT);
-
-        println!(
-            "i2s: rx_update applied, rx_conf=0x{:08x}",
-            core::ptr::read_volatile(RX_CONF),
-        );
     }
 
     println!(
-        "audio: I²S full-duplex DMA running ({} kHz, tx ring {} B, rx ring {} B)",
-        SAMPLE_RATE_HZ / 1000,
-        DMA_RING_BYTES,
-        RX_DMA_BYTES,
+        "i2s: rx_update applied, rx_conf=0x{:08x}",
+        unsafe { core::ptr::read_volatile(0x6000_F020 as *mut u32) },
     );
 
-    let fanfare_mono: &'static [u8] = Box::leak(build_fanfare_mono_buffer());
-    let mut state = AudioState {
-        fanfare_mono,
-        fanfare_pos: None,
-        last_sample: 0,
-        held_pending: false,
-    };
+    println!(
+        "audio: I²S full-duplex DMA running ({} kHz, tx ring {} B, rx ring {} B)",
+            SAMPLE_RATE_HZ / 1000,
+            DMA_RING_BYTES,
+            RX_DMA_BYTES,
+        );
 
-    let tx_fut = async {
-        loop {
-            if let Err(e) = tx_circ
-                .push_with(|dma_slice| state.fill_chunk(dma_slice))
-                .await
-            {
-                println!("audio: tx push err {:?}", e);
-                return;
-            }
-        }
-    };
+        let scratch: &'static mut [u8; RX_SCRATCH_BYTES] = {
+            static mut SCRATCH: [u8; RX_SCRATCH_BYTES] = [0; RX_SCRATCH_BYTES];
+            #[allow(static_mut_refs)]
+            unsafe { &mut SCRATCH }
+        };
+        let mono: &'static mut [u8; RX_SCRATCH_BYTES / 2] = {
+            static mut MONO: [u8; RX_SCRATCH_BYTES / 2] = [0; RX_SCRATCH_BYTES / 2];
+            #[allow(static_mut_refs)]
+            unsafe { &mut MONO }
+        };
 
-    // RX scratch + mono downmix buffer must be the full DMA ring size
-    // (~6 KB / ~3 KB — see `RX_SCRATCH_BYTES`). Putting them on the
-    // task stack would blow the embassy task stack budget, and the heap
-    // is too small for two multi-KB allocations once the rest of the
-    // firmware is up. Park them in BSS instead via local `static mut`
-    // (audio_task only runs once, so taking exclusive `&mut` is sound).
-    let scratch: &'static mut [u8; RX_SCRATCH_BYTES] = {
-        static mut SCRATCH: [u8; RX_SCRATCH_BYTES] = [0; RX_SCRATCH_BYTES];
-        #[allow(static_mut_refs)]
-        unsafe { &mut SCRATCH }
-    };
-    let mono: &'static mut [u8; RX_SCRATCH_BYTES / 2] = {
-        static mut MONO: [u8; RX_SCRATCH_BYTES / 2] = [0; RX_SCRATCH_BYTES / 2];
-        #[allow(static_mut_refs)]
-        unsafe { &mut MONO }
-    };
-
-    let rx_fut = async {
         println!("mic: rx loop entered");
         let mut last_err_log_ms: u64 = 0;
         loop {
@@ -937,12 +931,6 @@ async fn audio_task(
             let avail = match rx_circ.available().await {
                 Ok(n) => n,
                 Err(e) => {
-                    // `DmaError::Late` fires when one or more circular
-                    // descriptors got rewritten before we drained them
-                    // (e.g. display SPI init or WiFi pinned the executor
-                    // for >96 ms at startup). The DMA controller keeps
-                    // running — we just lost a chunk of samples. Skip
-                    // and continue rather than abandoning capture.
                     let now = Instant::now().as_millis();
                     if now.saturating_sub(last_err_log_ms) > 1000 {
                         println!("mic: rx avail err {:?} (continuing)", e);
@@ -954,8 +942,6 @@ async fn audio_task(
             if avail == 0 {
                 continue;
             }
-            // Drain in stereo-frame multiples so the L/R split below
-            // doesn't tear samples in half.
             let want = (avail.min(scratch.len())) & !0x3;
             if want == 0 {
                 continue;
@@ -971,21 +957,28 @@ async fn audio_task(
                     continue;
                 }
             };
-            // Always note the raw RX byte count — that's the diagnostic
-            // for "DMA is alive" vs "codec mute" vs "audio task stuck".
             mic::note_rx_seen(got);
             if got == 0 || !mic::is_running() {
                 continue;
             }
-            // ES8311 ADC is mono; it outputs its sample in the LEFT (WS-low)
-            // slot. Each 4-byte I²S RX frame: bytes 0,1 = left (s16le),
-            // bytes 2,3 = right (s16le, zeros/same). Take left only.
             let frames = got / 4;
             for f in 0..frames {
                 mono[f * 2] = scratch[f * 4];
                 mono[f * 2 + 1] = scratch[f * 4 + 1];
             }
             mic::push_pcm(&mono[..frames * 2]);
+        }
+    };
+
+    let tx_fut = async {
+        loop {
+            if let Err(e) = tx_circ
+                .push_with(|dma_slice| state.fill_chunk(dma_slice))
+                .await
+            {
+                println!("audio: tx push err {:?}", e);
+                return;
+            }
         }
     };
 
@@ -1014,6 +1007,9 @@ impl AudioState {
 
         if self.fanfare_pos.is_none() && buzzer::take_done_fanfare() {
             self.fanfare_pos = Some(0);
+            self.last_sample = 0;
+            self.held_pending = false;
+            println!("audio: fanfare start");
         }
 
         let gain = spk::gain_q8();
@@ -1035,11 +1031,15 @@ impl AudioState {
             );
             frames_done += frames;
             let new_pos = start + mono_take;
-            self.fanfare_pos = if new_pos >= self.fanfare_mono.len() {
+            let done = new_pos >= self.fanfare_mono.len();
+            self.fanfare_pos = if done {
                 None
             } else {
                 Some(new_pos)
             };
+            if done {
+                println!("audio: fanfare done");
+            }
         }
 
         // Stack-local scratch so we don't have a self-borrow conflict

@@ -9,6 +9,9 @@ use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
+
+#[cfg(feature = "board-sticks3")]
+use esp_hal::rtc_cntl::SocResetReason;
 use firmware::board;
 #[cfg(feature = "board-plus2")]
 use firmware::led_task;
@@ -20,16 +23,24 @@ esp_bootloader_esp_idf::esp_app_desc!();
 #[allow(clippy::large_stack_frames)]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
+    #[cfg(feature = "board-sticks3")]
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_160MHz);
+    #[cfg(not(feature = "board-sticks3"))]
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 40 * 1024);
+    // Internal-SRAM heap. esp-alloc caps the total region count at 3, so we
+    // budget one slot for "reclaimed", one for plain internal SRAM, and one
+    // for PSRAM (added below on the StickS3 path / via psram_allocator! on
+    // Plus2). StickS3 uses a larger internal slot than Plus2 because anything
+    // PSRAM can't host — structs containing `Atomic*` types (broken in PSRAM
+    // on ESP32/S2/S3), DMA-capable buffers, code paths the cache hasn't
+    // warmed up — has to live here.
+    #[cfg(feature = "board-plus2")]
     esp_alloc::heap_allocator!(size: 24 * 1024);
-    // StickS3 has 512 KB internal SRAM and we don't (yet) init the OPI PSRAM,
-    // so reserve another chunk for the 64,800-byte framebuffer + display ctl
-    // bookkeeping. Plus2 gets the same space from psram_allocator! below.
     #[cfg(feature = "board-sticks3")]
-    esp_alloc::heap_allocator!(size: 96 * 1024);
+    esp_alloc::heap_allocator!(size: 120 * 1024);
 
     // Allocate the spk PCM ring on the heap (too large for BSS without
     // running into the embassy task stack guard region on StickS3).
@@ -83,6 +94,14 @@ async fn main(spawner: Spawner) -> ! {
 
     #[cfg(feature = "board-sticks3")]
     {
+        if let Some(reason) = esp_hal::system::reset_reason() {
+            println!("boot: reset reason {:?}", reason);
+            if reason == SocResetReason::ChipPowerOn {
+                // ESP-IDF also uses 0x01 for brownout; treat repeat boots as suspect.
+            }
+        }
+
+        let psram_periph = peripherals.PSRAM;
         firmware::dev::spawn(
             &spawner,
             peripherals.I2C0,
@@ -116,11 +135,38 @@ async fn main(spawner: Spawner) -> ! {
             peripherals.GPIO7,
             peripherals.GPIO8,
         );
+
+        esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+        nvs::init(flash);
+
+        // PMIC + IMU first; OPI PSRAM after (avoids PSRAM + 8 KB IMU + WiFi together).
+        firmware::boot_gate::wait_devices_ready().await;
+
+        let psram = esp_hal::psram::Psram::new(psram_periph, esp_hal::psram::PsramConfig::default());
+        let (psram_ptr, psram_size) = psram.raw_parts();
+        if psram_size > 0 {
+            unsafe {
+                esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+                    psram_ptr,
+                    psram_size,
+                    esp_alloc::MemoryCapability::External.into(),
+                ));
+            }
+            println!("psram: ready ({} KiB)", psram_size / 1024);
+        } else {
+            println!("psram: init failed — running on internal SRAM only");
+        }
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
     }
 
-    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+    #[cfg(not(feature = "board-sticks3"))]
+    {
+        esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+        nvs::init(flash);
+    }
 
-    nvs::init(flash);
+    #[cfg(not(feature = "board-sticks3"))]
+    firmware::boot_gate::wait_devices_ready().await;
 
     if let Some(cfg) = nvs::load() {
         if cfg.is_valid() {

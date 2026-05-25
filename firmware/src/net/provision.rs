@@ -73,6 +73,11 @@ pub async fn run(spawner: &Spawner, wifi: esp_hal::peripherals::WIFI<'static>) -
     if let Some(cfg) = stack.config_v4() {
         println!("provision: net up {}", cfg.address);
     }
+    #[cfg(feature = "board-sticks3")]
+    {
+        println!("boot: network ready (provision AP)");
+        crate::boot_gate::signal_network_ready();
+    }
     spawner.spawn(dhcp_task(stack).unwrap());
     spawner.spawn(captive_dns(stack).unwrap());
     spawner.spawn(http_portal(stack).unwrap());
@@ -208,6 +213,8 @@ fn query_len(q: &[u8]) -> usize {
 async fn http_portal(stack: Stack<'static>) {
     stack.wait_config_up().await;
     println!("provision: http listening on :80 (2 slots)");
+    #[cfg(feature = "board-sticks3")]
+    crate::boot_gate::mark_subsystem_ready(crate::boot_gate::SUBSYS_NET9P);
 
     loop {
         select(

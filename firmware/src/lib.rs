@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod board;
+pub mod boot_gate;
 pub mod dev;
 pub mod led_task;
 pub mod net;

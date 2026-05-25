@@ -16,6 +16,9 @@ pub const PATH_SYS_BOARD: u64 = 5;
 pub const PATH_SYS_VERSION: u64 = 6;
 pub const PATH_SYS_UPTIME: u64 = 7;
 pub const PATH_SYS_REBOOT: u64 = 8;
+pub const PATH_SYS_MAC: u64 = 45;
+pub const PATH_SYS_CHIP: u64 = 46;
+pub const PATH_SYS_HEAP: u64 = 47;
 pub const PATH_DEV: u64 = 9;
 pub const PATH_DEV_LED: u64 = 10;
 pub const PATH_DEV_LED_CTL: u64 = 11;
@@ -104,6 +107,9 @@ pub enum Node {
     SysVersion,
     SysUptime,
     SysReboot,
+    SysMac,
+    SysChip,
+    SysHeap,
     Dev,
     DevLed,
     DevLedCtl,
@@ -158,6 +164,9 @@ impl Node {
             PATH_SYS_VERSION => Node::SysVersion,
             PATH_SYS_UPTIME => Node::SysUptime,
             PATH_SYS_REBOOT => Node::SysReboot,
+            PATH_SYS_MAC => Node::SysMac,
+            PATH_SYS_CHIP => Node::SysChip,
+            PATH_SYS_HEAP => Node::SysHeap,
             PATH_DEV => Node::Dev,
             PATH_DEV_LED => Node::DevLed,
             PATH_DEV_LED_CTL => Node::DevLedCtl,
@@ -244,6 +253,9 @@ impl Node {
             Node::SysVersion => PATH_SYS_VERSION,
             Node::SysUptime => PATH_SYS_UPTIME,
             Node::SysReboot => PATH_SYS_REBOOT,
+            Node::SysMac => PATH_SYS_MAC,
+            Node::SysChip => PATH_SYS_CHIP,
+            Node::SysHeap => PATH_SYS_HEAP,
             Node::Dev => PATH_DEV,
             Node::DevLed => PATH_DEV_LED,
             Node::DevLedCtl => PATH_DEV_LED_CTL,
@@ -297,6 +309,9 @@ impl Node {
             Node::SysVersion => "version",
             Node::SysUptime => "uptime",
             Node::SysReboot => "reboot",
+            Node::SysMac => "mac",
+            Node::SysChip => "chip",
+            Node::SysHeap => "heap",
             Node::Dev => "dev",
             Node::DevLed => "led",
             Node::DevLedCtl => "ctl",
@@ -403,6 +418,9 @@ impl Node {
             (Node::Sys, "version") => Some(Node::SysVersion),
             (Node::Sys, "uptime") => Some(Node::SysUptime),
             (Node::Sys, "reboot") => Some(Node::SysReboot),
+            (Node::Sys, "mac") => Some(Node::SysMac),
+            (Node::Sys, "chip") => Some(Node::SysChip),
+            (Node::Sys, "heap") => Some(Node::SysHeap),
             (Node::Dev, "led") => Some(Node::DevLed),
             (Node::Dev, "display") => Some(Node::DevDisplay),
             (Node::Dev, "imu") => Some(Node::DevImu),
@@ -461,6 +479,9 @@ impl Node {
                 Node::SysVersion,
                 Node::SysUptime,
                 Node::SysReboot,
+                Node::SysMac,
+                Node::SysChip,
+                Node::SysHeap,
             ],
             Node::Dev => &[
                 Node::DevLed,
@@ -516,6 +537,13 @@ pub struct FsContext<'a> {
     pub board_name: &'a str,
     pub version: &'a str,
     pub uptime_ms: fn() -> u64,
+    /// `/sys/mac` — `aa:bb:cc:dd:ee:ff\n`.
+    pub sys_mac_line: fn() -> heapless::String<24>,
+    /// `/sys/chip` — `model=… rev=M.m cores=… cpu_mhz=…\n`.
+    pub sys_chip_line: fn() -> heapless::String<96>,
+    /// `/sys/heap` — one line per region (`sram free=… used=… total=…\n`,
+    /// `psram free=… used=… total=…\n`).
+    pub sys_heap_line: fn() -> heapless::String<160>,
     pub led_state_line: fn() -> heapless::String<32>,
     pub on_led_ctl: fn(&str) -> Result<(), &'static str>,
     pub request_reboot: fn(),
@@ -563,6 +591,9 @@ impl<'a> Default for FsContext<'a> {
             board_name: "unknown",
             version: "unknown",
             uptime_ms: || 0,
+            sys_mac_line: heapless::String::new,
+            sys_chip_line: heapless::String::new,
+            sys_heap_line: heapless::String::new,
             led_state_line: || heapless::String::new(),
             on_led_ctl: |_| Err("no led"),
             request_reboot: || {},
@@ -681,6 +712,18 @@ pub fn read_file(node: Node, ctx: &FsContext<'_>, off: u64, buf: &mut [u8]) -> u
             let ms = (ctx.uptime_ms)();
             let _ = s.push_str(&heapless::String::<32>::from(u64_to_str(ms)));
             let _ = s.push('\n');
+        }
+        Node::SysMac => {
+            let line = (ctx.sys_mac_line)();
+            return copy_string(line.as_str(), off, buf);
+        }
+        Node::SysChip => {
+            let line = (ctx.sys_chip_line)();
+            return copy_string(line.as_str(), off, buf);
+        }
+        Node::SysHeap => {
+            let line = (ctx.sys_heap_line)();
+            return copy_string(line.as_str(), off, buf);
         }
         Node::DevLedState => {
             let line = (ctx.led_state_line)();

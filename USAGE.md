@@ -22,6 +22,9 @@ Board-specific gaps and open bugs are noted inline; see the repo `ISSUES.md` on 
 │   ├── board           "plus2"
 │   ├── version         firmware version string
 │   ├── uptime          milliseconds since boot
+│   ├── mac             base efuse MAC (aa:bb:cc:dd:ee:ff)
+│   ├── chip            model rev cores cpu_mhz
+│   ├── heap            free / used / total bytes
 │   └── reboot          write anything → reboot
 └── dev/
     ├── led/
@@ -39,7 +42,7 @@ Board-specific gaps and open bugs are noted inline; see the repo `ISSUES.md` on 
     ├── buttons/
     │   ├── a           "0\n" or "1\n" level (1 = pressed)
     │   ├── b           same
-    │   ├── event       edge stream (BROKEN — see below)
+    │   ├── event       edge stream (use `dd bs=12 count=1`; `cat` batches — see below)
     │   └── ctl         flush
     ├── power/
     │   ├── ctl         hold on | hold off | shutdown
@@ -61,7 +64,7 @@ Board-specific gaps and open bugs are noted inline; see the repo `ISSUES.md` on 
             └── level   read: '0'/'1'; write: '0'/'1' (output only)
 ```
 
-**Not on Plus2:** `dev/spk`, IR, M5PM1 rails, StickS3-only nodes. **StickS3** firmware profile boots, runs Wi‑Fi + 9P, drives the ST7789P3 LCD (M5PM1 L3B rail enabled at init, GPIO38 backlight pulsed up after L3B is ready), the BMI270 IMU (`/dev/imu/{accel,gyro}` at 100 Hz, ±4 g / ±1000 dps), the side buttons (KEY1=G11→`a`, KEY2=G12→`b`), the M5PM1 battery sense (`/dev/power/{battery,vbat_mv}`), and the ES8311 + AW8737 audio path. Boot fanfare plays automatically; `/dev/spk/{ctl,pcm,info}` exposes the full streaming PCM API (mono s16le @ 16 kHz over circular I²S DMA). `/dev/led/*` is no‑op on hardware (M5PM1-owned status LED, see [ISSUES.md](ISSUES.md)); mic capture remains deferred.
+**Not on Plus2:** `dev/spk`, IR, M5PM1 rails, StickS3-only nodes. **StickS3** runs Wi‑Fi + 9P with **staggered boot** (`firmware/src/boot_gate.rs`): PMIC + IMU → WiFi/DHCP → L3B + display + codec (amp off) → `boot: ready` → fanfare → mic RX. ST7789P3 (L3B + GPIO38 BL), BMI270 @ 100 Hz, buttons G11/G12, M5PM1 VBAT, ES8311 + AW8737 speaker (`/dev/spk/*`), MEMS mic (`/dev/mic/*` @ 16 kHz). `/dev/led/*` is no‑op ([ISSUES.md](ISSUES.md)). Serial boot checklist: [ISSUES.md](ISSUES.md) (§ StickS3 boot sequencing).
 
 ---
 
@@ -116,6 +119,63 @@ Write any UTF-8 payload to trigger immediate software reset.
 ```bash
 echo reboot > sys/reboot
 ```
+
+---
+
+## `/sys/mac`
+
+Base efuse MAC address (used as Wi-Fi STA address and as input to the provisioning SSID/password derivation).
+
+```bash
+cat sys/mac          # e.g. 7c:9e:bd:11:22:33
+```
+
+---
+
+## `/sys/chip`
+
+Single-line SoC description: `model rev cores cpu_mhz`.
+
+```bash
+cat sys/chip
+# model=esp32 rev=3.0 cores=2 cpu_mhz=240
+```
+
+| Field | Source |
+|-------|--------|
+| `model` | `esp32` (Plus2) or `esp32s3` (StickS3) |
+| `rev` | `efuse::chip_revision()` — `major.minor` |
+| `cores` | static (2 on both boards) |
+| `cpu_mhz` | live `esp_hal::clock::cpu_clock()` |
+
+---
+
+## `/sys/heap`
+
+Per-pool heap stats from `esp-alloc`, one line per memory kind:
+
+- **`sram`** — sum of every internal-SRAM region registered at boot. Used for atomics, DMA buffers, locks, and anything that must stay accessible while the cache is suspended.
+- **`psram`** — external PSRAM (only present if PSRAM init succeeded for the board).
+
+```bash
+cat sys/heap
+# sram free=11616 used=53920 total=65536
+# psram free=4144768 used=49152 total=4193920
+```
+
+| Field | Meaning |
+|-------|---------|
+| `total` | Pool size in bytes (sum of constituent regions) |
+| `used` | Currently allocated bytes |
+| `free` | Currently free bytes (`total = free + used`) |
+
+**Caveats on PSRAM (Plus2 + StickS3):**
+
+- Slower than SRAM (SPI/OPI-mediated). Cache helps but cold reads are ~10× slower.
+- **`Atomic*` types do not work in PSRAM on ESP32/S2/S3** — esp-alloc warns this is silent UB. The allocator places allocations across all regions by capability, so anything that ends up containing atomics must be kept in SRAM. Practically: don't `Box::new(SomeStructWithAtomic)` and hope.
+- DMA-capable peripherals usually require SRAM source/destination buffers.
+
+Useful for spotting leaks: `while true; do cat sys/heap; sleep 5; done`. If a pool's `used` keeps climbing rather than oscillating, something is leaking in that pool.
 
 ---
 
@@ -383,7 +443,7 @@ echo 'beep 2000 50' > dev/buzzer/ctl
 
 ## `/dev/spk/ctl` *(StickS3 only)*
 
-ES8311 codec + AW8737 1 W amp on I²S0 (MCLK=G18, BCLK=G17, LRCK=G15, DOUT=G14). The audio task runs a **circular `write_dma_circular_async` ring** (4 KiB stereo ≈ 64 ms @ 16 kHz) and uses `push_with` to refill it from either the boot fanfare or `/dev/spk/pcm`. BCLK/LRCK never stop while the task is alive, so streams play without inter-chunk clicks or tremolo. The DMA buffer is allocated via the `dma_circular_buffers!` macro (word-aligned static — heap buffers cause hardware misalignment on circular reads).
+ES8311 codec + AW8737 1 W amp on I²S0 (MCLK=G18, BCLK=G17, LRCK=G15, DOUT=G14). Boot fanfare runs once after `boot: ready` (see [ISSUES.md](ISSUES.md)). The audio task runs a **6144-byte** circular TX ring (≈ 96 ms @ 16 kHz) via `dma_circular_buffers!` and `push_with` (boot fanfare or `/dev/spk/pcm`). BCLK/LRCK stay running while the task is alive.
 
 | Command | Meaning |
 |---------|---------|
@@ -559,42 +619,49 @@ cat dev/gpio/3/level     # → "1\n" floating / button released
 
 ## `/dev/mic/ctl`
 
-SPM1423 PDM mic (GPIO0 clock, GPIO34 data). **Capture path not working:** `queued=` stays 0 after `start`.
+| Board | Hardware | Status |
+|-------|----------|--------|
+| **Plus2** | SPM1423 PDM (GPIO0 CLK, GPIO34 DATA) | **Broken** — `queued=0` after `start` ([ISSUES.md](ISSUES.md)) |
+| **StickS3** | ES8311 ADC, 16 kHz mono s16le | **Working** — full-duplex I²S after boot fanfare; `rate` fixed at 16000 |
 
 | Command | Meaning |
 |---------|---------|
 | `start` | Enable capture (flush ring, set running) |
 | `stop` | Stop capture |
 | `flush` | Clear PCM ring |
-| `rate <Hz>` | Store rate (8000, 16000, 32000, 44100, 48000); hardware fixed **44100** on ESP32 today |
+| `rate <Hz>` | Store rate; hardware **44100** (Plus2 PDM) or **16000** (StickS3 ES8311) |
 | `bits 16` | Ack only (16-bit only) |
 | `gain <N>` | Ack only (not applied yet) |
+
+**Plus2** (broken today):
 
 ```bash
 echo start > dev/mic/ctl
 cat dev/mic/ctl
 # running=1 rate=44100 queued=0 fmt=s16le
-echo stop > dev/mic/ctl
-echo flush > dev/mic/ctl
 ```
 
-When capture works, expect `queued=` to grow while speaking.
+**StickS3** (after boot fanfare / `mic: rx loop entered` in serial):
+
+```bash
+echo start > dev/mic/ctl
+cat dev/mic/ctl
+# running=1 rate=16000 queued=… fmt=s16le
+dd if=dev/mic/pcm of=clip.raw bs=4096 count=50
+echo stop > dev/mic/ctl
+# host:
+ffmpeg -f s16le -ar 16000 -ac 1 -i clip.raw clip.wav
+```
 
 ---
 
 ## `/dev/mic/pcm`
 
-**Status: broken** — read blocks forever with empty ring. Intended: blocking stream of **mono s16le little-endian @ 44100 Hz**.
+Blocking stream of **mono s16le little-endian**. Sample rate follows board: **44100 Hz** (Plus2, not capturing) or **16000 Hz** (StickS3).
 
-Planned usage:
+**Plus2:** broken — read blocks with empty ring ([ISSUES.md](ISSUES.md)).
 
-```bash
-echo start > dev/mic/ctl
-dd if=dev/mic/pcm of=clip.raw bs=4096 count=100
-echo stop > dev/mic/ctl
-# host:
-ffmpeg -f s16le -ar 44100 -ac 1 -i clip.raw clip.wav
-```
+**StickS3:** working — `echo start > dev/mic/ctl` then `dd if=dev/mic/pcm …` as above.
 
 ---
 
@@ -673,5 +740,5 @@ echo 1 > sys/reboot
 - **Large reads:** use offset/count; `README` length is non-zero in stat (full doc size).
 - **Framebuffer** length is 64800 in stat.
 - **`buttons/event`** delivers per-event under small reads (`dd bs=12 count=1`) but batches under `cat` — kernel v9fs quirk, see ISSUES.
-- **Do not** assume `mic/pcm` works without checking `cat dev/mic/ctl` / ISSUES.
+- **Plus2:** do not assume `mic/pcm` works (`queued=0`). **StickS3:** mic is live @ 16 kHz after boot fanfare.
 - **Concurrent clients:** two sessions (TCP + WS) share device state; one global button event queue.

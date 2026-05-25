@@ -1,6 +1,6 @@
 # Known issues
 
-Tracked bugs and gaps not yet fixed. Stage 3 adds Plus2 PDM mic (`/dev/mic`); speaker/`/dev/spk` deferred (weak buzzer only on Plus2).
+Tracked bugs and gaps not yet fixed. **StickS3** boot sequencing and fanfare are resolved (2026-05). **Plus2** PDM mic (`/dev/mic/pcm`) and `/dev/spk` remain open (buzzer only on Plus2).
 
 ---
 
@@ -66,8 +66,8 @@ For programs you control, `read(fd, buf, 12)` will return one event per call.
 
 ## `/dev/display/brightness` — no usable dimming on Plus2
 
-**Status:** Open (deferred until StickS3 hardware available)  
-**Board:** M5StickC Plus2 only tested so far
+**Status:** Open (Plus2 only; StickS3 uses M5PM1 L3B — retest dimming there)  
+**Board:** M5StickC Plus2 (GPIO27 LEDC); StickS3 backlight on GPIO38 after L3B rail
 
 ### Symptoms
 
@@ -127,7 +127,7 @@ dd if=/mnt/stick/dev/mic/pcm of=clip.raw bs=4096 count=50
 | Ring + ctl | `devices/src/mic.rs` |
 | 9P blocking read | `ninep/src/server.rs` — `WaitStream` / `MicPcm` while `running` and queue empty |
 
-`/dev/spk` omitted on Plus2 (buzzer only). StickS3 ES8311 mic path deferred.
+`/dev/spk` omitted on Plus2 (buzzer only). **StickS3** mic capture is live (ES8311 ADC, 16 kHz mono s16le); **Plus2** PDM path remains broken below.
 
 ### Things to verify when revisiting
 
@@ -140,6 +140,61 @@ dd if=/mnt/stick/dev/mic/pcm of=clip.raw bs=4096 count=50
 ### Workarounds
 
 - None on device today. Stage 3 mic remains **tree + ctl API only** until PDM capture works.
+
+---
+
+## StickS3 boot sequencing — **resolved** (2026-05)
+
+**Status:** Fixed — verified on hardware (consistent WiFi, fanfare, 9P, serial tail)  
+**Board:** M5Stack StickS3 only
+
+### Expected serial (healthy boot)
+
+```text
+boot: reset reason …          # CoreUsbUart after USB monitor reset is normal
+boot: devices ready (PMIC+IMU, no L3B/codec/amp)
+psram: ready (8192 KiB)
+sta: wifi init ok (lean buffers, tx capped)
+wifi: connected …
+boot: network ready
+9p: waiting tcp/564
+m5pm1: L3B rail enabled …
+es8311: programmed (amp off until fanfare)
+display: ST7789P3 ok …
+boot: ready (codec+display+9p)
+audio: boot complete, waiting for amp
+m5pm1: AW8737 amp enabled for fanfare
+audio: amp ready, starting I²S
+i2s: master ok
+i2s: dma buffers ok
+audio: TX DMA starting (boot fanfare)
+audio: fanfare done
+audio: starting RX DMA after boot settle
+mic: rx loop entered
+```
+
+LCD: `booting…` banner early, then green **READY / ip …** after STA. Speaker: **only** the two-tone fanfare after `boot: ready` (880 Hz → 1175 Hz).
+
+### Bring-up order (`firmware/src/boot_gate.rs`)
+
+| Step | What runs |
+|------|-----------|
+| 1 | PMIC + BMI270 (no L3B / codec / amp / I²S) |
+| 2 | `main` waits `devices_ready`, then OPI PSRAM, then WiFi STA |
+| 3 | After DHCP: `network_ready` → L3B, display, ES8311 (**DAC muted**, amp off) |
+| 4 | `boot: ready` when codec + display + `9p: waiting` (or provision HTTP) |
+| 5 | `i2c_task` enables amp + unmutes DAC; `audio_task` starts I²S → fanfare → RX/mic |
+
+WiFi tuning: `firmware/src/net/sticks3_wifi.rs` (lean buffers, 2 dBm TX during connect), CPU **160 MHz** at boot, 1 s delay before `connect_async`.
+
+### Remaining quirks (not boot failures)
+
+- **Soft clicks at `wifi: connection task`** — speaker path still off (no L3B yet). Usually PMIC/RF, not fanfare. Ignore unless sound continues after `AW8737 amp enabled for fanfare`.
+- **`Broken pipe` in espflash monitor** — USB-CDC can drop during I²S/DMA; device may still be up (`ping` / `nc` port 564). Use `i2s: master ok` lines to see how far boot got.
+
+### History (what was wrong)
+
+Early builds stacked WiFi + L3B + amp + display SPI + IMU upload + fanfare → brownouts/resets. Later a **deadlock**: `audio_task` consumed the `BOOT_COMPLETE` signal so `i2c_task` never enabled the amp (`wait_amp_ready` forever, no fanfare). Fixed with `BOOT_DONE` (`AtomicBool`) + DAC mute until fanfare.
 
 ---
 

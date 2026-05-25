@@ -5,18 +5,28 @@ use embassy_net::StackResources;
 use embassy_time::Timer;
 use esp_hal::rng::Rng;
 use esp_println::println;
-use esp_radio::wifi::{sta::StationConfig, Config, ControllerConfig};
+use esp_radio::wifi::{sta::StationConfig, Config};
+#[cfg(not(feature = "board-sticks3"))]
+use esp_radio::wifi::ControllerConfig;
 
 use crate::mk_static;
 use crate::nvs::WifiConfig;
 use crate::net::runner::{net_task, wifi_connection_task};
 use crate::net::services::{log_ip, spawn_sta_services};
 
+#[cfg(feature = "board-sticks3")]
+use crate::net::sticks3_wifi;
+
 pub async fn run(
     spawner: &Spawner,
     wifi: esp_hal::peripherals::WIFI<'static>,
     cfg: WifiConfig,
 ) -> ! {
+    #[cfg(feature = "board-sticks3")]
+    {
+        Timer::after(embassy_time::Duration::from_millis(300)).await;
+    }
+
     println!("sta: connecting to {}", cfg.ssid.as_str());
 
     let station = Config::Station(
@@ -25,11 +35,18 @@ pub async fn run(
             .with_password(cfg.password.as_str().into()),
     );
 
-    let (controller, interfaces) = esp_radio::wifi::new(
-        wifi,
-        ControllerConfig::default().with_initial_config(station),
-    )
-    .expect("wifi sta");
+    #[cfg(feature = "board-sticks3")]
+    let wifi_cfg = sticks3_wifi::controller_config(station);
+    #[cfg(not(feature = "board-sticks3"))]
+    let wifi_cfg = ControllerConfig::default().with_initial_config(station);
+
+    let (mut controller, interfaces) = esp_radio::wifi::new(wifi, wifi_cfg).expect("wifi sta");
+
+    #[cfg(feature = "board-sticks3")]
+    {
+        let _ = controller.set_max_tx_power(sticks3_wifi::TX_POWER_CONNECT);
+        println!("sta: wifi init ok (lean buffers, tx capped)");
+    }
 
     let net_cfg = embassy_net::Config::dhcpv4(Default::default());
     let rng = Rng::new();
@@ -47,6 +64,11 @@ pub async fn run(
     println!("sta: waiting for DHCP...");
     stack.wait_config_up().await;
     log_ip(&stack);
+    #[cfg(feature = "board-sticks3")]
+    {
+        println!("boot: network ready");
+        crate::boot_gate::signal_network_ready();
+    }
     println!("sta: 9P tcp/564  ws/8080/9p");
 
     spawn_sta_services(spawner, stack);
