@@ -1,5 +1,8 @@
 //! Board peripheral tasks (Stage 2 + Stage 3 mic).
 
+pub mod gpio;
+pub mod i2c1;
+
 #[cfg(feature = "board-plus2")]
 mod mic;
 

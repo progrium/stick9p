@@ -35,6 +35,9 @@ pub fn spawn(
     dma_i2s0: esp_hal::peripherals::DMA_I2S0<'static>,
     mic_clk: esp_hal::peripherals::GPIO0<'static>,
     mic_data: esp_hal::peripherals::GPIO34<'static>,
+    i2c1: esp_hal::peripherals::I2C1<'static>,
+    i2c1_sda: esp_hal::peripherals::GPIO32<'static>,
+    i2c1_scl: esp_hal::peripherals::GPIO33<'static>,
 ) {
     let fb = Box::new([0u8; display::FB_LEN]);
     let fb: &'static mut [u8; display::FB_LEN] = Box::leak(fb);
@@ -55,6 +58,15 @@ pub fn spawn(
         mic_clk,
         mic_data,
     );
+
+    // External I²C bus 1 (Grove HY2.0 PORT.A: SDA=G32, SCL=G33). The bus
+    // is shared with `/dev/i2c/1`; transactions execute synchronously in
+    // the 9P session.
+    let bus1 = I2c::new(i2c1, I2cConfig::default())
+        .unwrap()
+        .with_sda(i2c1_sda)
+        .with_scl(i2c1_scl);
+    super::i2c1::install(bus1);
 
     buzzer::request_stage2_done();
     println!("stage3: devices ready (mic PDM)");

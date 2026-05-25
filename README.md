@@ -14,9 +14,9 @@ Full architecture and hardware targets: [DESIGN.md](DESIGN.md). Open bugs: [ISSU
 | `/dev/buttons/event` | Broken — see [ISSUES.md](ISSUES.md) |
 | `/dev/display/brightness` | On/off only — dimming deferred |
 | `/dev/mic/pcm` | Tree + ctl present; **no capture** (`queued=0`) — [ISSUES.md](ISSUES.md) |
-| StickS3 (`board-sticks3`) | Wi‑Fi + 9P + ST7789P3 display (boot/ready splash) working; M5PM1 init enables L3B; `/dev/led/*` no‑op on hardware ([ISSUES.md](ISSUES.md)); IMU/buttons/audio not yet wired |
+| StickS3 (`board-sticks3`) | Wi‑Fi + 9P + ST7789P3 display, BMI270 IMU (`/dev/imu/{accel,gyro}`, ±4 g / ±1000 dps / 100 Hz), buttons G11/G12, M5PM1 VBAT (`/dev/power/{battery,vbat_mv}`), ES8311 + AW8737 boot fanfare, **`/dev/spk/{ctl,pcm,info}` streaming** (mono s16le @ 16 kHz, circular I²S DMA, software gain). `/dev/led/*` no‑op on hardware ([ISSUES.md](ISSUES.md)); mic capture deferred (same gap as Plus2) |
 
-Firmware version string: `stick9p-0.3.0-stage3-mic` (`cat /mnt/stick/sys/version`).
+Firmware version string: `stick9p-0.4.0-stage3-spk` (`cat /mnt/stick/sys/version`).
 
 ## Prerequisites
 
@@ -55,7 +55,7 @@ cargo build -p firmware
 cargo run -p firmware    # flash + monitor (USB serial, CH9102 on Plus2)
 ```
 
-StickS3 (Wi‑Fi + 9P + display; IMU/buttons/audio still to land):
+StickS3 (Wi‑Fi + 9P + display + IMU + buttons + battery + boot fanfare):
 
 ```bash
 cargo build -p firmware --no-default-features --features board-sticks3 --target xtensa-esp32s3-none-elf
@@ -64,7 +64,7 @@ cargo run -p firmware --no-default-features --features board-sticks3 --target xt
 
 The repo default `.cargo/config.toml` target is **Plus2** (`xtensa-esp32-none-elf`); StickS3 builds must pass `--target xtensa-esp32s3-none-elf` (or override `build.target` in a local config).
 
-**StickS3 serial / flash notes:** Native USB-JTAG — use `--before usb-reset --after hard-reset` (already set in the S3 runner). If the monitor shows `boot:0x23 (DOWNLOAD)` and `waiting for download`, the chip is in the ROM bootloader, not running firmware: close other serial tools, **quick-press** the side reset button once, then re-flash. Run `espflash monitor` from Terminal.app/iTerm (Cursor’s terminal often fails with “Failed to initialize input reader”). On boot the LCD shows a `stick9p / booting…` banner, then a green **READY / ip …** banner once WiFi associates — visible confirmation that the new flash came up.
+**StickS3 serial / flash notes:** Native USB-JTAG — use `--before usb-reset --after hard-reset` (already set in the S3 runner). If the monitor shows `boot:0x23 (DOWNLOAD)` and `waiting for download`, the chip is in the ROM bootloader, not running firmware: close other serial tools, **quick-press** the side reset button once, then re-flash. Run `espflash monitor` from Terminal.app/iTerm (Cursor’s terminal often fails with “Failed to initialize input reader”). On boot the LCD shows a `stick9p / booting…` banner, then a green **READY / ip …** banner once WiFi associates, plus a two-tone (880 Hz → 1175 Hz) fanfare from the speaker — visible *and* audible confirmation that the new flash came up.
 
 ## First boot and mount
 
@@ -107,7 +107,7 @@ Use **`msize=4096`** (server caps negotiated size to fit Plus2 buffers). Reads l
     └── mic/ctl, pcm              # pcm: not capturing — ISSUES.md
 ```
 
-Not on Plus2: `/dev/spk`, IR, M5PM1 power rails, StickS3-only nodes (see DESIGN §6).
+Not on Plus2: `/dev/spk`, IR, M5PM1 power rails, StickS3-only nodes (see DESIGN §6). On StickS3 the tree adds `dev/spk/{ctl,pcm,info}` — see [USAGE.md](USAGE.md#devspkctl-sticks3-only).
 
 ### Examples
 
@@ -137,6 +137,13 @@ cat /mnt/stick/dev/power/vbat_mv
 
 # Buzzer (GPIO2) — avoid during mic experiments
 echo 'beep 1000 100' | sudo tee /mnt/stick/dev/buzzer/ctl
+
+# Speaker (StickS3 only) — ES8311 + AW8737, mono s16le @ 16 kHz
+echo fanfare | sudo tee /mnt/stick/dev/spk/ctl              # replay boot beeps
+ffmpeg -y -i in.wav -f s16le -ar 16000 -ac 1 - | \
+    (echo start | sudo tee /mnt/stick/dev/spk/ctl; \
+     sudo cp /dev/stdin /mnt/stick/dev/spk/pcm; \
+     echo stop  | sudo tee /mnt/stick/dev/spk/ctl)
 ```
 
 ### Mic (experimental — capture not working)

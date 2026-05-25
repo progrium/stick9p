@@ -31,6 +31,10 @@ async fn main(spawner: Spawner) -> ! {
     #[cfg(feature = "board-sticks3")]
     esp_alloc::heap_allocator!(size: 96 * 1024);
 
+    // Allocate the spk PCM ring on the heap (too large for BSS without
+    // running into the embassy task stack guard region on StickS3).
+    devices::spk::init();
+
     println!();
     println!("=====================================================");
     println!(" stick9p Stage 3 — board {}", board::BOARD_NAME);
@@ -71,6 +75,9 @@ async fn main(spawner: Spawner) -> ! {
             peripherals.DMA_I2S0,
             peripherals.GPIO0,
             peripherals.GPIO34,
+            peripherals.I2C1,
+            peripherals.GPIO32,
+            peripherals.GPIO33,
         );
     }
 
@@ -81,6 +88,8 @@ async fn main(spawner: Spawner) -> ! {
             peripherals.I2C0,
             peripherals.GPIO47,
             peripherals.GPIO48,
+            peripherals.GPIO11,
+            peripherals.GPIO12,
             peripherals.SPI2,
             peripherals.GPIO39,
             peripherals.GPIO40,
@@ -88,6 +97,23 @@ async fn main(spawner: Spawner) -> ! {
             peripherals.GPIO41,
             peripherals.GPIO21,
             peripherals.GPIO38,
+            peripherals.I2S0,
+            peripherals.DMA_CH0,
+            peripherals.GPIO18,
+            peripherals.GPIO17,
+            peripherals.GPIO15,
+            peripherals.GPIO14,
+            peripherals.I2C1,
+            peripherals.GPIO9,
+            peripherals.GPIO10,
+            peripherals.GPIO1,
+            peripherals.GPIO2,
+            peripherals.GPIO3,
+            peripherals.GPIO4,
+            peripherals.GPIO5,
+            peripherals.GPIO6,
+            peripherals.GPIO7,
+            peripherals.GPIO8,
         );
     }
 

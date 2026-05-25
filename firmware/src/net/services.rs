@@ -7,7 +7,7 @@ use ninep::server::Session;
 
 use crate::board::{BOARD_NAME, FW_VERSION};
 use crate::net::buffers;
-use devices::{buttons, buzzer, display, imu, led, mic, power};
+use devices::{buttons, buzzer, display, imu, led, mic, power, spk};
 
 pub const TCP_9P_PORT: u16 = 564;
 pub const WS_PORT: u16 = 8080;
@@ -44,7 +44,44 @@ fn fs_context() -> FsContext<'static> {
         on_buzzer_ctl: buzzer::handle_ctl,
         read_mic_pcm: mic::try_read_pcm,
         on_mic_ctl: mic::handle_ctl,
+        write_spk_pcm: spk_write_pcm_for_board,
+        on_spk_ctl: spk_ctl_for_board,
+        on_i2c1_ctl: crate::dev::i2c1::on_ctl,
+        on_i2c1_data: crate::dev::i2c1::on_data,
+        read_i2c1_scan: crate::dev::i2c1::read_scan,
+        on_gpio_ctl: crate::dev::gpio::on_ctl,
+        on_gpio_level: crate::dev::gpio::on_level,
+        refresh_gpio_level: crate::dev::gpio::refresh_level,
     }
+}
+
+/// Sink for `/dev/spk/pcm` writes. StickS3 fills the ring buffer for the
+/// audio task; Plus2 silently swallows the bytes so a curious client doesn't
+/// fill an unused queue.
+#[cfg(feature = "board-sticks3")]
+fn spk_write_pcm_for_board(off: u64, data: &[u8]) -> usize {
+    spk::write_pcm(off, data)
+}
+
+#[cfg(not(feature = "board-sticks3"))]
+fn spk_write_pcm_for_board(_off: u64, data: &[u8]) -> usize {
+    // No speaker → pretend the write succeeded so clients don't spin, but
+    // never touch the ring (which would only ever be drained by an audio
+    // task that doesn't exist on this board).
+    data.len()
+}
+
+/// `/dev/spk/ctl` on Plus2 has no audio task to drain the ring, so reject
+/// commands cleanly instead of pretending to accept them. StickS3 routes to
+/// the real `spk::handle_ctl`.
+#[cfg(feature = "board-sticks3")]
+fn spk_ctl_for_board(s: &str) -> Result<(), &'static str> {
+    spk::handle_ctl(s)
+}
+
+#[cfg(not(feature = "board-sticks3"))]
+fn spk_ctl_for_board(_s: &str) -> Result<(), &'static str> {
+    Err("no spk on this board (use /dev/buzzer/ctl)")
 }
 
 fn copy_line(off: u64, buf: &mut [u8], line: &str) -> usize {

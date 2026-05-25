@@ -47,12 +47,21 @@ Board-specific gaps and open bugs are noted inline; see the repo `ISSUES.md` on 
     │   └── vbat_mv     integer mV
     ├── buzzer/
     │   └── ctl         beep <hz> <ms> | stop
-    └── mic/
-        ├── ctl         start | stop | flush | rate | bits | gain
-        └── pcm         s16le mono PCM stream (CAPTURE BROKEN)
+    ├── mic/
+    │   ├── ctl         start | stop | flush | rate | bits | gain
+    │   └── pcm         s16le mono PCM stream (CAPTURE BROKEN)
+    ├── i2c/
+    │   └── 1/          external I²C bus (Grove HY2.0 PORT.A)
+    │       ├── ctl     freq <hz>; also accepts r/w/rw transaction lines
+    │       ├── scan    read: probes 0x08..0x77, returns ack'd addrs
+    │       └── data    write: r/w/rw transaction; read: last result bytes
+    └── gpio/           user-claimable digital pins
+        └── <N>/        one dir per pin (StickS3: 1..8 on Hat2 header)
+            ├── ctl     mode: in | in-pup | in-pdn | out | out-od
+            └── level   read: '0'/'1'; write: '0'/'1' (output only)
 ```
 
-**Not on Plus2:** `dev/spk`, IR, M5PM1 rails, StickS3-only nodes. **StickS3** firmware profile boots, runs Wi‑Fi + 9P, and drives the ST7789P3 LCD (M5PM1 L3B rail enabled at init, GPIO38 backlight pulsed up after L3B is ready); `/dev/led/*` is no‑op on hardware (M5PM1-owned status LED, see [ISSUES.md](ISSUES.md)); IMU, buttons, battery sense, and audio are not wired yet.
+**Not on Plus2:** `dev/spk`, IR, M5PM1 rails, StickS3-only nodes. **StickS3** firmware profile boots, runs Wi‑Fi + 9P, drives the ST7789P3 LCD (M5PM1 L3B rail enabled at init, GPIO38 backlight pulsed up after L3B is ready), the BMI270 IMU (`/dev/imu/{accel,gyro}` at 100 Hz, ±4 g / ±1000 dps), the side buttons (KEY1=G11→`a`, KEY2=G12→`b`), the M5PM1 battery sense (`/dev/power/{battery,vbat_mv}`), and the ES8311 + AW8737 audio path. Boot fanfare plays automatically; `/dev/spk/{ctl,pcm,info}` exposes the full streaming PCM API (mono s16le @ 16 kHz over circular I²S DMA). `/dev/led/*` is no‑op on hardware (M5PM1-owned status LED, see [ISSUES.md](ISSUES.md)); mic capture remains deferred.
 
 ---
 
@@ -85,7 +94,7 @@ cat sys/board          # plus2
 Firmware version string (includes stage tag).
 
 ```bash
-cat sys/version        # e.g. stick9p-0.3.0-stage3-mic
+cat sys/version        # e.g. stick9p-0.4.0-stage3-spk
 ```
 
 ---
@@ -354,6 +363,184 @@ echo 'beep 1000 100' > dev/buzzer/ctl
 echo 'beep 2000 50' > dev/buzzer/ctl
 ```
 
+**StickS3 has no piezo** — the equivalent tone path is `/dev/spk/ctl fanfare` (replays the boot two‑beep) or feeding s16le PCM through `/dev/spk/pcm`. Writes to `/dev/buzzer/ctl` on StickS3 still succeed at the 9P layer for schema parity but produce no sound.
+
+---
+
+## `/dev/spk/ctl` *(StickS3 only)*
+
+ES8311 codec + AW8737 1 W amp on I²S0 (MCLK=G18, BCLK=G17, LRCK=G15, DOUT=G14). The audio task runs a **circular `write_dma_circular_async` ring** (4 KiB stereo ≈ 64 ms @ 16 kHz) and uses `push_with` to refill it from either the boot fanfare or `/dev/spk/pcm`. BCLK/LRCK never stop while the task is alive, so streams play without inter-chunk clicks or tremolo. The DMA buffer is allocated via the `dma_circular_buffers!` macro (word-aligned static — heap buffers cause hardware misalignment on circular reads).
+
+| Command | Meaning |
+|---------|---------|
+| `start` | Begin draining `/dev/spk/pcm` into the codec |
+| `stop` | Stop draining; ring keeps any queued samples |
+| `flush` | Empty the PCM ring immediately |
+| `fanfare` | Re-play the boot two‑beep (880 Hz → 1175 Hz, 360 ms) |
+| `rate <Hz>` | Store rate (8000/16000/22050/32000/44100/48000); hardware fixed at **16000** today |
+| `bits 16` | Ack only (16-bit only) |
+| `gain <N>` | Software multiplier in Q8 (0..512, **256 = unity**) applied before mono→stereo expansion |
+
+```bash
+cat dev/spk/ctl
+# running=0 rate=16000 gain=256 queued=0 cap=32768 under=0 fmt=s16le ch=1
+echo fanfare > dev/spk/ctl     # play boot beeps any time
+echo 'gain 320' > dev/spk/ctl  # +2 dB
+echo start > dev/spk/ctl
+# … feed samples via /dev/spk/pcm …
+echo stop > dev/spk/ctl
+```
+
+`under=` counts producer underruns (audio task ran while `running=1` but the ring was empty). Non-zero means your client isn't keeping up with the 32 KiB/s drain rate.
+
+On Plus2, `cat /dev/spk/ctl` reads as **0 bytes** and writes return `no spk on this board (use /dev/buzzer/ctl)`.
+
+---
+
+## `/dev/spk/pcm` *(StickS3 only)*
+
+**Write-only** stream of **mono s16le @ 16 kHz** samples (32 KiB/s). The firmware expands each mono sample to stereo (L=R) before the DMA stage so any client can feed mono audio directly.
+
+The ring is 32 KiB (≈ 1.0 s of audio). When it's full, Twrite returns a short count — 9P clients retry the remainder, giving natural backpressure. There's no need for a separate `flow control` ctl.
+
+```bash
+# 'say hello' through macOS → mono 16-bit PCM → speaker
+say -v Samantha "stick 9p says hi" -o /tmp/hi.aiff
+ffmpeg -y -i /tmp/hi.aiff -f s16le -ar 16000 -ac 1 /tmp/hi.s16
+
+echo start > dev/spk/ctl
+dd if=/tmp/hi.s16 of=dev/spk/pcm bs=4096
+echo stop > dev/spk/ctl
+```
+
+```bash
+# 440 Hz test tone (1 s):
+python3 -c '
+import math,struct,sys
+for i in range(16000):
+    s=int(0.4*32767*math.sin(2*math.pi*440*i/16000))
+    sys.stdout.buffer.write(struct.pack("<h", s))
+' > /tmp/a440.s16
+echo start > dev/spk/ctl
+cat /tmp/a440.s16 > dev/spk/pcm
+echo stop > dev/spk/ctl
+```
+
+Reads from `/dev/spk/pcm` return 0 — it's a pipe, not a file.
+
+---
+
+## `/dev/spk/info` *(StickS3 only)*
+
+Read-only one-liner describing the codec format. Useful for auto-detecting parameters from a client.
+
+```bash
+cat dev/spk/info
+# fmt=s16le ch=1 rate=16000
+```
+
+---
+
+## `/dev/i2c/1/ctl`, `/dev/i2c/1/scan`, `/dev/i2c/1/data`
+
+External I²C bus on the Grove HY2.0 PORT.A connector (StickS3 SDA=G9, SCL=G10; Plus2 SDA=G32, SCL=G33).
+Transactions execute synchronously inside the 9P session — no separate `start`/`stop`,
+no async polling. Addresses are 7-bit; values accept either decimal (`16`) or hex (`0x10`).
+
+### `ctl` — bus config + transactions
+
+| Write | Effect |
+|-------|--------|
+| `freq <Hz>` | Reconfigure bus clock (range 10000…1000000, default 100000). Takes effect on the next transaction. |
+| `r <addr> <count>` | Read `count` bytes from `addr`. Result lands in `data`. |
+| `w <addr> <byte>…` | Write bytes to `addr`. |
+| `rw <addr> <write_byte>… <read_count>` | Write-then-restart-read in one transaction (the typical "read register" pattern). |
+
+Read of `ctl` returns one line: `freq=<hz> last=<idle|ok|err:msg>\n`.
+
+### `scan` — bus discovery
+
+Read of `scan` probes every 7-bit address from `0x08` to `0x77` and returns the
+addresses that ACK'd, one hex per line. Each `Tread` at offset 0 re-runs the
+probe, so unplugging or hot-swapping a unit between reads gives fresh results.
+
+### `data` — transaction shortcut + result
+
+Writes accept the same `r`/`w`/`rw` lines as `ctl` (without `freq`). Reads
+return the raw response bytes from the most recent read or rw — useful for
+piping into other tools (e.g. `xxd`, `od`, or a host script).
+
+Errors: `nack` (no device at that address), `arbitration lost`, `timeout`,
+`fifo overflow`. Check `cat dev/i2c/1/ctl` after a failed write to see which.
+
+```bash
+cat dev/i2c/1/scan
+# 0x18
+# 0x68
+# 0x6e            ← (these are on the *internal* bus on StickS3; on the
+                  #    external Grove port you'll see whatever you plug in)
+
+# Read the WHO_AM_I register (0x75) on an MPU6050 at 0x68
+echo 'rw 0x68 0x75 1' > dev/i2c/1/ctl
+xxd dev/i2c/1/data   # 00000000: 68
+cat dev/i2c/1/ctl    # freq=100000 last=ok
+
+# Drive a Grove relay/LED expander (e.g. PCA9554 at 0x20) — set output register
+echo 'w 0x20 0x03 0x00' > dev/i2c/1/data   # config: all pins output
+echo 'w 0x20 0x01 0xff' > dev/i2c/1/data   # output:  all pins high
+
+# Bump the bus to 400 kHz fast-mode
+echo 'freq 400000' > dev/i2c/1/ctl
+```
+
+Max 64 bytes per direction in a single transaction (write payload, read
+count, or write half of `rw`). Split larger transfers across multiple
+commands; the bus retains no state between them.
+
+---
+
+## `/dev/gpio/<N>/ctl` and `/dev/gpio/<N>/level` *(StickS3 only)*
+
+Per-pin digital I/O on the Hat2-Bus header. StickS3 exposes G1..G8;
+Plus2 has no spare claimable pins in the v0.6 board map (G32/G33 are
+permanently bound to `/dev/i2c/1`). Reading `/dev/gpio/<N>/ctl` on a
+board that doesn't wire the pin returns `absent\n`.
+
+### `ctl` — mode
+
+| Write | Result |
+|-------|--------|
+| `in`, `in-z`, `input` | Floating input (no pull). Default at boot. |
+| `in-pup`, `in-up`, `pullup` | Input with internal pull-up. |
+| `in-pdn`, `in-down`, `pulldown` | Input with internal pull-down. |
+| `out`, `out-pp`, `output` | Push-pull output. Defaults to low. |
+| `out-od`, `open-drain` | Open-drain output. Idles high (Hi-Z); reads also work. |
+
+Read returns one line: `mode=<m> [out=<0|1>] in=<0|1>\n`. `in=` always
+reflects the most recent sample of the physical pin, even in output
+mode (so you can verify your drive made it onto the line).
+
+### `level` — read / write
+
+- Read returns `0\n` or `1\n` based on the current pin level (input
+  buffer sample, or output drive readback).
+- Write `0` or `1` to drive the pin **only when configured as output**.
+  Writes to inputs return an error.
+
+```bash
+# Drive G7 as a push-pull output, blink it at 2 Hz
+echo out > dev/gpio/7/ctl
+while true; do
+    echo 1 > dev/gpio/7/level; sleep 0.25
+    echo 0 > dev/gpio/7/level; sleep 0.25
+done
+
+# Read a button hanging off G3 (pulled-up internally)
+echo in-pup > dev/gpio/3/ctl
+cat dev/gpio/3/level     # → "1\n" floating / button released
+                         # → "0\n" button pressed to GND
+```
+
 ---
 
 ## `/dev/mic/ctl`
@@ -426,6 +613,36 @@ for i in $(seq 1 20); do cat dev/imu/accel; sleep 0.2; done
 ```bash
 cat dev/power/battery
 cat dev/power/vbat_mv
+```
+
+### Speak through StickS3
+
+```bash
+echo fanfare > dev/spk/ctl        # boot two-beep on demand
+# or play a WAV from the host:
+ffmpeg -y -i sample.wav -f s16le -ar 16000 -ac 1 - | \
+    (echo start > dev/spk/ctl; cat > dev/spk/pcm; echo stop > dev/spk/ctl)
+```
+
+### Probe a Grove I²C unit
+
+```bash
+cat dev/i2c/1/scan
+# 0x44                    # example: SHT3x temp/humidity at 0x44
+
+echo 'rw 0x44 0x24 0x00 6' > dev/i2c/1/ctl   # one-shot high-rep measure
+sleep 0.02
+xxd dev/i2c/1/data
+```
+
+### Hat2 GPIO blinker
+
+```bash
+echo out > dev/gpio/2/ctl
+for i in $(seq 1 10); do
+    echo 1 > dev/gpio/2/level; sleep 0.1
+    echo 0 > dev/gpio/2/level; sleep 0.1
+done
 ```
 
 ### Safe reboot from mount

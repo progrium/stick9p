@@ -43,6 +43,56 @@ pub const PATH_DEV_BUZZER_CTL: u64 = 32;
 pub const PATH_DEV_MIC: u64 = 33;
 pub const PATH_DEV_MIC_CTL: u64 = 34;
 pub const PATH_DEV_MIC_PCM: u64 = 35;
+pub const PATH_DEV_SPK: u64 = 36;
+pub const PATH_DEV_SPK_CTL: u64 = 37;
+pub const PATH_DEV_SPK_PCM: u64 = 38;
+pub const PATH_DEV_SPK_INFO: u64 = 39;
+pub const PATH_DEV_I2C: u64 = 40;
+pub const PATH_DEV_I2C_1: u64 = 41;
+pub const PATH_DEV_I2C_1_CTL: u64 = 42;
+pub const PATH_DEV_I2C_1_SCAN: u64 = 43;
+pub const PATH_DEV_I2C_1_DATA: u64 = 44;
+pub const PATH_DEV_GPIO: u64 = 50;
+/// Base path for `/dev/gpio/<N>` directories. The pin number (1..=8) is
+/// added to derive the actual path id.
+pub const PATH_DEV_GPIO_PIN_BASE: u64 = 60;
+pub const PATH_DEV_GPIO_PIN_CTL_BASE: u64 = 70;
+pub const PATH_DEV_GPIO_PIN_LEVEL_BASE: u64 = 80;
+
+/// Static names for `/dev/gpio/<N>` directory entries. Indexed by pin
+/// number (1..=8 from the StickS3 Hat2 header), with `?` for the
+/// always-invalid 0 slot.
+const GPIO_PIN_NAMES: &[&str] = &["?", "1", "2", "3", "4", "5", "6", "7", "8"];
+
+fn gpio_pin_name(n: u8) -> &'static str {
+    GPIO_PIN_NAMES
+        .get(n as usize)
+        .copied()
+        .unwrap_or("?")
+}
+
+const GPIO_PIN1_CHILDREN: &[Node] = &[Node::DevGpioPinCtl(1), Node::DevGpioPinLevel(1)];
+const GPIO_PIN2_CHILDREN: &[Node] = &[Node::DevGpioPinCtl(2), Node::DevGpioPinLevel(2)];
+const GPIO_PIN3_CHILDREN: &[Node] = &[Node::DevGpioPinCtl(3), Node::DevGpioPinLevel(3)];
+const GPIO_PIN4_CHILDREN: &[Node] = &[Node::DevGpioPinCtl(4), Node::DevGpioPinLevel(4)];
+const GPIO_PIN5_CHILDREN: &[Node] = &[Node::DevGpioPinCtl(5), Node::DevGpioPinLevel(5)];
+const GPIO_PIN6_CHILDREN: &[Node] = &[Node::DevGpioPinCtl(6), Node::DevGpioPinLevel(6)];
+const GPIO_PIN7_CHILDREN: &[Node] = &[Node::DevGpioPinCtl(7), Node::DevGpioPinLevel(7)];
+const GPIO_PIN8_CHILDREN: &[Node] = &[Node::DevGpioPinCtl(8), Node::DevGpioPinLevel(8)];
+
+/// All pin dirs under `/dev/gpio` — one entry per `devices::gpio::CLAIMABLE_PINS`.
+/// Pin presence is then per-board, decided at runtime: reads of an
+/// unregistered pin return `absent\n` without crashing the listing.
+const GPIO_DIR_CHILDREN: &[Node] = &[
+    Node::DevGpioPin(1),
+    Node::DevGpioPin(2),
+    Node::DevGpioPin(3),
+    Node::DevGpioPin(4),
+    Node::DevGpioPin(5),
+    Node::DevGpioPin(6),
+    Node::DevGpioPin(7),
+    Node::DevGpioPin(8),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Node {
@@ -81,6 +131,20 @@ pub enum Node {
     DevMic,
     DevMicCtl,
     DevMicPcm,
+    DevSpk,
+    DevSpkCtl,
+    DevSpkPcm,
+    DevSpkInfo,
+    DevI2c,
+    DevI2c1,
+    DevI2c1Ctl,
+    DevI2c1Scan,
+    DevI2c1Data,
+    DevGpio,
+    /// `/dev/gpio/<N>` directory. Inner u8 is the GPIO pin number.
+    DevGpioPin(u8),
+    DevGpioPinCtl(u8),
+    DevGpioPinLevel(u8),
 }
 
 impl Node {
@@ -121,6 +185,25 @@ impl Node {
             PATH_DEV_MIC => Node::DevMic,
             PATH_DEV_MIC_CTL => Node::DevMicCtl,
             PATH_DEV_MIC_PCM => Node::DevMicPcm,
+            PATH_DEV_SPK => Node::DevSpk,
+            PATH_DEV_SPK_CTL => Node::DevSpkCtl,
+            PATH_DEV_SPK_PCM => Node::DevSpkPcm,
+            PATH_DEV_SPK_INFO => Node::DevSpkInfo,
+            PATH_DEV_I2C => Node::DevI2c,
+            PATH_DEV_I2C_1 => Node::DevI2c1,
+            PATH_DEV_I2C_1_CTL => Node::DevI2c1Ctl,
+            PATH_DEV_I2C_1_SCAN => Node::DevI2c1Scan,
+            PATH_DEV_I2C_1_DATA => Node::DevI2c1Data,
+            PATH_DEV_GPIO => Node::DevGpio,
+            p if (PATH_DEV_GPIO_PIN_BASE..PATH_DEV_GPIO_PIN_CTL_BASE).contains(&p) => {
+                Node::DevGpioPin((p - PATH_DEV_GPIO_PIN_BASE) as u8 + 1)
+            }
+            p if (PATH_DEV_GPIO_PIN_CTL_BASE..PATH_DEV_GPIO_PIN_LEVEL_BASE).contains(&p) => {
+                Node::DevGpioPinCtl((p - PATH_DEV_GPIO_PIN_CTL_BASE) as u8 + 1)
+            }
+            p if (PATH_DEV_GPIO_PIN_LEVEL_BASE..PATH_DEV_GPIO_PIN_LEVEL_BASE + 16).contains(&p) => {
+                Node::DevGpioPinLevel((p - PATH_DEV_GPIO_PIN_LEVEL_BASE) as u8 + 1)
+            }
             _ => return None,
         })
     }
@@ -136,7 +219,12 @@ impl Node {
             | Node::DevButtons
             | Node::DevPower
             | Node::DevBuzzer
-            | Node::DevMic => (QT_DIR, self.path()),
+            | Node::DevMic
+            | Node::DevSpk
+            | Node::DevI2c
+            | Node::DevI2c1
+            | Node::DevGpio => (QT_DIR, self.path()),
+            Node::DevGpioPin(_) => (QT_DIR, self.path()),
             _ => (QT_FILE, self.path()),
         };
         Qid {
@@ -183,6 +271,19 @@ impl Node {
             Node::DevMic => PATH_DEV_MIC,
             Node::DevMicCtl => PATH_DEV_MIC_CTL,
             Node::DevMicPcm => PATH_DEV_MIC_PCM,
+            Node::DevSpk => PATH_DEV_SPK,
+            Node::DevSpkCtl => PATH_DEV_SPK_CTL,
+            Node::DevSpkPcm => PATH_DEV_SPK_PCM,
+            Node::DevSpkInfo => PATH_DEV_SPK_INFO,
+            Node::DevI2c => PATH_DEV_I2C,
+            Node::DevI2c1 => PATH_DEV_I2C_1,
+            Node::DevI2c1Ctl => PATH_DEV_I2C_1_CTL,
+            Node::DevI2c1Scan => PATH_DEV_I2C_1_SCAN,
+            Node::DevI2c1Data => PATH_DEV_I2C_1_DATA,
+            Node::DevGpio => PATH_DEV_GPIO,
+            Node::DevGpioPin(n) => PATH_DEV_GPIO_PIN_BASE + (n.saturating_sub(1)) as u64,
+            Node::DevGpioPinCtl(n) => PATH_DEV_GPIO_PIN_CTL_BASE + (n.saturating_sub(1)) as u64,
+            Node::DevGpioPinLevel(n) => PATH_DEV_GPIO_PIN_LEVEL_BASE + (n.saturating_sub(1)) as u64,
         }
     }
 
@@ -223,6 +324,19 @@ impl Node {
             Node::DevMic => "mic",
             Node::DevMicCtl => "ctl",
             Node::DevMicPcm => "pcm",
+            Node::DevSpk => "spk",
+            Node::DevSpkCtl => "ctl",
+            Node::DevSpkPcm => "pcm",
+            Node::DevSpkInfo => "info",
+            Node::DevI2c => "i2c",
+            Node::DevI2c1 => "1",
+            Node::DevI2c1Ctl => "ctl",
+            Node::DevI2c1Scan => "scan",
+            Node::DevI2c1Data => "data",
+            Node::DevGpio => "gpio",
+            Node::DevGpioPin(n) => gpio_pin_name(n),
+            Node::DevGpioPinCtl(_) => "ctl",
+            Node::DevGpioPinLevel(_) => "level",
         }
     }
 
@@ -233,9 +347,14 @@ impl Node {
             | Node::DevButtons
             | Node::DevPower
             | Node::DevBuzzer
-            | Node::DevMic => {
+            | Node::DevMic
+            | Node::DevSpk
+            | Node::DevI2c
+            | Node::DevI2c1
+            | Node::DevGpio => {
                 0x80000000 | 0o555
             }
+            Node::DevGpioPin(_) => 0x80000000 | 0o555,
             Node::DevLedCtl
             | Node::Ctl
             | Node::SysReboot
@@ -247,7 +366,12 @@ impl Node {
             | Node::DevBtnEvent
             | Node::DevPowerCtl
             | Node::DevBuzzerCtl
-            | Node::DevMicCtl => MODE_FILE_WR,
+            | Node::DevMicCtl
+            | Node::DevSpkCtl
+            | Node::DevSpkPcm
+            | Node::DevI2c1Ctl
+            | Node::DevI2c1Data => MODE_FILE_WR,
+            Node::DevGpioPinCtl(_) | Node::DevGpioPinLevel(_) => MODE_FILE_WR,
             _ => MODE_FILE_RD,
         }
     }
@@ -283,6 +407,23 @@ impl Node {
             (Node::Dev, "power") => Some(Node::DevPower),
             (Node::Dev, "buzzer") => Some(Node::DevBuzzer),
             (Node::Dev, "mic") => Some(Node::DevMic),
+            (Node::Dev, "spk") => Some(Node::DevSpk),
+            (Node::Dev, "i2c") => Some(Node::DevI2c),
+            (Node::DevI2c, "1") => Some(Node::DevI2c1),
+            (Node::DevI2c1, "ctl") => Some(Node::DevI2c1Ctl),
+            (Node::DevI2c1, "scan") => Some(Node::DevI2c1Scan),
+            (Node::DevI2c1, "data") => Some(Node::DevI2c1Data),
+            (Node::Dev, "gpio") => Some(Node::DevGpio),
+            (Node::DevGpio, name) => {
+                let n: u8 = name.parse().ok()?;
+                if devices::gpio::CLAIMABLE_PINS.contains(&n) {
+                    Some(Node::DevGpioPin(n))
+                } else {
+                    None
+                }
+            }
+            (Node::DevGpioPin(n), "ctl") => Some(Node::DevGpioPinCtl(n)),
+            (Node::DevGpioPin(n), "level") => Some(Node::DevGpioPinLevel(n)),
             (Node::DevLed, "ctl") => Some(Node::DevLedCtl),
             (Node::DevLed, "state") => Some(Node::DevLedState),
             (Node::DevDisplay, "ctl") => Some(Node::DevDisplayCtl),
@@ -302,6 +443,9 @@ impl Node {
             (Node::DevBuzzer, "ctl") => Some(Node::DevBuzzerCtl),
             (Node::DevMic, "ctl") => Some(Node::DevMicCtl),
             (Node::DevMic, "pcm") => Some(Node::DevMicPcm),
+            (Node::DevSpk, "ctl") => Some(Node::DevSpkCtl),
+            (Node::DevSpk, "pcm") => Some(Node::DevSpkPcm),
+            (Node::DevSpk, "info") => Some(Node::DevSpkInfo),
             _ => None,
         }
     }
@@ -323,6 +467,9 @@ impl Node {
                 Node::DevPower,
                 Node::DevBuzzer,
                 Node::DevMic,
+                Node::DevSpk,
+                Node::DevI2c,
+                Node::DevGpio,
             ],
             Node::DevLed => &[Node::DevLedCtl, Node::DevLedState],
             Node::DevDisplay => &[
@@ -345,6 +492,18 @@ impl Node {
             ],
             Node::DevBuzzer => &[Node::DevBuzzerCtl],
             Node::DevMic => &[Node::DevMicCtl, Node::DevMicPcm],
+            Node::DevSpk => &[Node::DevSpkCtl, Node::DevSpkPcm, Node::DevSpkInfo],
+            Node::DevI2c => &[Node::DevI2c1],
+            Node::DevI2c1 => &[Node::DevI2c1Ctl, Node::DevI2c1Scan, Node::DevI2c1Data],
+            Node::DevGpio => GPIO_DIR_CHILDREN,
+            Node::DevGpioPin(1) => GPIO_PIN1_CHILDREN,
+            Node::DevGpioPin(2) => GPIO_PIN2_CHILDREN,
+            Node::DevGpioPin(3) => GPIO_PIN3_CHILDREN,
+            Node::DevGpioPin(4) => GPIO_PIN4_CHILDREN,
+            Node::DevGpioPin(5) => GPIO_PIN5_CHILDREN,
+            Node::DevGpioPin(6) => GPIO_PIN6_CHILDREN,
+            Node::DevGpioPin(7) => GPIO_PIN7_CHILDREN,
+            Node::DevGpioPin(8) => GPIO_PIN8_CHILDREN,
             _ => &[],
         }
     }
@@ -374,6 +533,25 @@ pub struct FsContext<'a> {
     pub on_buzzer_ctl: fn(&str) -> Result<(), &'static str>,
     pub read_mic_pcm: fn(u64, &mut [u8]) -> usize,
     pub on_mic_ctl: fn(&str) -> Result<(), &'static str>,
+    pub write_spk_pcm: fn(u64, &[u8]) -> usize,
+    pub on_spk_ctl: fn(&str) -> Result<(), &'static str>,
+    /// `/dev/i2c/1/ctl` writes: `freq HZ` plus the transaction subset
+    /// (`r ADDR COUNT`, `w ADDR B...`, `rw ADDR W... COUNT`).
+    pub on_i2c1_ctl: fn(&str) -> Result<(), &'static str>,
+    /// `/dev/i2c/1/data` writes: parse + execute a transaction line
+    /// (same subset as above, minus `freq`).
+    pub on_i2c1_data: fn(&str) -> Result<(), &'static str>,
+    /// `/dev/i2c/1/scan` reads: triggers a fresh scan and returns the
+    /// detected addresses (one hex per line).
+    pub read_i2c1_scan: fn(u64, &mut [u8]) -> usize,
+    /// `/dev/gpio/<N>/ctl` writes — first arg is the pin number, second
+    /// is the mode line (`in`/`in-pup`/`in-pdn`/`out`/`out-od`).
+    pub on_gpio_ctl: fn(u8, &str) -> Result<(), &'static str>,
+    /// `/dev/gpio/<N>/level` writes — `0` or `1` (only valid on outputs).
+    pub on_gpio_level: fn(u8, &str) -> Result<(), &'static str>,
+    /// `/dev/gpio/<N>/level` reads — refresh the cached input level (if
+    /// the pin is configured as input) and return it.
+    pub refresh_gpio_level: fn(u8),
 }
 
 impl<'a> Default for FsContext<'a> {
@@ -402,6 +580,14 @@ impl<'a> Default for FsContext<'a> {
             on_buzzer_ctl: |_| Err("no buzzer"),
             read_mic_pcm: |_, _| 0,
             on_mic_ctl: |_| Err("no mic"),
+            write_spk_pcm: |_, _| 0,
+            on_spk_ctl: |_| Err("no speaker"),
+            on_i2c1_ctl: |_| Err("no i2c bus"),
+            on_i2c1_data: |_| Err("no i2c bus"),
+            read_i2c1_scan: |_, _| 0,
+            on_gpio_ctl: |_, _| Err("no gpio on this board"),
+            on_gpio_level: |_, _| Err("no gpio on this board"),
+            refresh_gpio_level: |_| {},
         }
     }
 }
@@ -421,6 +607,12 @@ pub fn is_writable(node: Node) -> bool {
             | Node::DevPowerCtl
             | Node::DevBuzzerCtl
             | Node::DevMicCtl
+            | Node::DevSpkCtl
+            | Node::DevSpkPcm
+            | Node::DevI2c1Ctl
+            | Node::DevI2c1Data
+            | Node::DevGpioPinCtl(_)
+            | Node::DevGpioPinLevel(_)
     )
 }
 
@@ -454,6 +646,22 @@ pub fn read_file(node: Node, ctx: &FsContext<'_>, off: u64, buf: &mut [u8]) -> u
     }
     if node == Node::Readme {
         return copy_string(crate::readme::TEXT, off, buf);
+    }
+    if node == Node::DevI2c1Scan {
+        return (ctx.read_i2c1_scan)(off, buf);
+    }
+    if node == Node::DevI2c1Data {
+        return devices::i2c1::read_data(off, buf);
+    }
+    if let Node::DevGpioPinLevel(pin) = node {
+        // Refresh the cached input level by sampling the hardware once.
+        (ctx.refresh_gpio_level)(pin);
+        let line = devices::gpio::level_line(pin);
+        return copy_string(line.as_str(), off, buf);
+    }
+    if let Node::DevGpioPinCtl(pin) = node {
+        let line = devices::gpio::ctl_status_line(pin);
+        return copy_string(line.as_str(), off, buf);
     }
 
     let mut s: String<128> = String::new();
@@ -494,6 +702,17 @@ pub fn read_file(node: Node, ctx: &FsContext<'_>, off: u64, buf: &mut [u8]) -> u
             let line = devices::mic::status_line();
             let _ = s.push_str(line.as_str());
         }
+        Node::DevSpkCtl => {
+            let line = devices::spk::status_line();
+            let _ = s.push_str(line.as_str());
+        }
+        Node::DevSpkInfo => {
+            let _ = s.push_str(devices::spk::INFO_TEXT);
+        }
+        Node::DevI2c1Ctl => {
+            let line = devices::i2c1::status_line();
+            let _ = s.push_str(line.as_str());
+        }
         _ => return 0,
     }
     copy_string(&s, off, buf)
@@ -502,6 +721,11 @@ pub fn read_file(node: Node, ctx: &FsContext<'_>, off: u64, buf: &mut [u8]) -> u
 pub fn write_file(node: Node, ctx: &FsContext<'_>, off: u64, data: &[u8]) -> Result<usize, &'static str> {
     if node == Node::DevDisplayFb {
         let n = (ctx.write_display_fb)(off, data);
+        return Ok(n);
+    }
+    if node == Node::DevSpkPcm {
+        // Binary PCM stream — never parse as UTF-8.
+        let n = (ctx.write_spk_pcm)(off, data);
         return Ok(n);
     }
 
@@ -520,6 +744,11 @@ pub fn write_file(node: Node, ctx: &FsContext<'_>, off: u64, data: &[u8]) -> Res
         Node::DevPowerCtl => (ctx.on_power_ctl)(s).map(|_| data.len()),
         Node::DevBuzzerCtl => (ctx.on_buzzer_ctl)(s).map(|_| data.len()),
         Node::DevMicCtl => (ctx.on_mic_ctl)(s).map(|_| data.len()),
+        Node::DevSpkCtl => (ctx.on_spk_ctl)(s).map(|_| data.len()),
+        Node::DevI2c1Ctl => (ctx.on_i2c1_ctl)(s).map(|_| data.len()),
+        Node::DevI2c1Data => (ctx.on_i2c1_data)(s).map(|_| data.len()),
+        Node::DevGpioPinCtl(pin) => (ctx.on_gpio_ctl)(pin, s).map(|_| data.len()),
+        Node::DevGpioPinLevel(pin) => (ctx.on_gpio_level)(pin, s).map(|_| data.len()),
         _ => Err("permission denied"),
     }
 }

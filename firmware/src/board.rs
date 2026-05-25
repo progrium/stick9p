@@ -26,4 +26,4 @@ pub const BOARD_NAME: &str = {
     }
 };
 
-pub const FW_VERSION: &str = "stick9p-0.3.0-stage3-mic";
+pub const FW_VERSION: &str = "stick9p-0.5.1-stage4-i2c-gpio";
