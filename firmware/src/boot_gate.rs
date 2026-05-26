@@ -25,6 +25,9 @@ mod imp {
     static SUBSYSTEMS: AtomicU8 = AtomicU8::new(0);
     /// Latched when codec+display+9p are ready. Not consumed by `wait_boot_complete`.
     static BOOT_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    /// Captive-portal AP: skip AW8737 + I²S fanfare (same brownout stack as STA boot).
+    static PROVISIONING: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
 
     pub fn signal_devices_ready() {
         DEVICES_READY.signal(());
@@ -72,6 +75,14 @@ mod imp {
     pub const SUBSYS_CODEC: u8 = BIT_CODEC;
     pub const SUBSYS_DISPLAY: u8 = BIT_DISPLAY;
     pub const SUBSYS_NET9P: u8 = BIT_NET9P;
+
+    pub fn set_provisioning(on: bool) {
+        PROVISIONING.store(on, Ordering::Release);
+    }
+
+    pub fn is_provisioning() -> bool {
+        PROVISIONING.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(not(feature = "board-sticks3"))]
@@ -90,6 +101,10 @@ mod imp {
     pub const SUBSYS_CODEC: u8 = 0;
     pub const SUBSYS_DISPLAY: u8 = 0;
     pub const SUBSYS_NET9P: u8 = 0;
+    pub fn set_provisioning(_on: bool) {}
+    pub fn is_provisioning() -> bool {
+        false
+    }
 }
 
 pub use imp::*;

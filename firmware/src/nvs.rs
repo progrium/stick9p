@@ -11,7 +11,7 @@ const NVS_OFFSET: u32 = 0x3d_0000;
 static FLASH: StaticCell<FlashStorage<'static>> = StaticCell::new();
 static mut FLASH_PTR: *mut FlashStorage<'static> = core::ptr::null_mut();
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WifiConfig {
     pub ssid: heapless::String<32>,
     pub password: heapless::String<64>,
@@ -68,12 +68,22 @@ pub fn erase() -> Result<(), ()> {
 }
 
 pub fn save(cfg: &WifiConfig) -> Result<(), ()> {
+    if !cfg.is_valid() {
+        return Err(());
+    }
+    // Clear the slot first so a prior erase()/failed write cannot leave a bad magic.
+    erase()?;
     let flash = flash();
-    let mut buf = [0u8; 128];
+    let mut buf = [0xffu8; 128];
     buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     buf[4] = cfg.ssid.len() as u8;
     buf[8..8 + cfg.ssid.len()].copy_from_slice(cfg.ssid.as_bytes());
     buf[36] = cfg.password.len() as u8;
     buf[40..40 + cfg.password.len()].copy_from_slice(cfg.password.as_bytes());
-    flash.write(NVS_OFFSET, &buf).map_err(|_| ())
+    flash.write(NVS_OFFSET, &buf).map_err(|_| ())?;
+    // Read-back verify (catches silent flash failures).
+    match load() {
+        Some(loaded) if loaded.ssid == cfg.ssid && loaded.password == cfg.password => Ok(()),
+        _ => Err(()),
+    }
 }

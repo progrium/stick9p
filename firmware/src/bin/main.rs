@@ -59,7 +59,26 @@ async fn main(spawner: Spawner) -> ! {
 
     #[cfg(feature = "board-plus2")]
     {
-        esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+        const MEMFS_ARENA: usize = 1024 * 1024;
+        let psram = esp_hal::psram::Psram::new(peripherals.PSRAM, esp_hal::psram::PsramConfig::default());
+        let (psram_ptr, psram_size) = psram.raw_parts();
+        if psram_size > 0 {
+            let arena_len = MEMFS_ARENA.min(psram_size);
+            devices::memfs::init(psram_ptr, arena_len);
+            println!("tmp: arena {} KiB", arena_len / 1024);
+            if psram_size > arena_len {
+                unsafe {
+                    esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+                        psram_ptr.add(arena_len),
+                        psram_size - arena_len,
+                        esp_alloc::MemoryCapability::External.into(),
+                    ));
+                }
+            }
+            println!("psram: ready ({} KiB heap)", (psram_size - arena_len) / 1024);
+        } else {
+            println!("psram: init failed — /tmp unavailable");
+        }
         let _hold = board::pins::init_hold(peripherals.GPIO4);
         let led: esp_hal::gpio::Output<'static> =
             unsafe { core::mem::transmute(board::pins::init_led(peripherals.GPIO19)) };
@@ -142,17 +161,45 @@ async fn main(spawner: Spawner) -> ! {
         // PMIC + IMU first; OPI PSRAM after (avoids PSRAM + 8 KB IMU + WiFi together).
         firmware::boot_gate::wait_devices_ready().await;
 
+        const MEMFS_ARENA: usize = 2 * 1024 * 1024;
+        let provision_boot = match nvs::load() {
+            None => true,
+            Some(c) => !c.is_valid(),
+        };
         let psram = esp_hal::psram::Psram::new(psram_periph, esp_hal::psram::PsramConfig::default());
         let (psram_ptr, psram_size) = psram.raw_parts();
         if psram_size > 0 {
-            unsafe {
-                esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
-                    psram_ptr,
-                    psram_size,
-                    esp_alloc::MemoryCapability::External.into(),
-                ));
+            if provision_boot {
+                // Captive portal does not need /tmp; keep all PSRAM for heap/WiFi.
+                unsafe {
+                    esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+                        psram_ptr,
+                        psram_size,
+                        esp_alloc::MemoryCapability::External.into(),
+                    ));
+                }
+                println!(
+                    "psram: ready ({} KiB heap, /tmp deferred until STA)",
+                    psram_size / 1024
+                );
+            } else {
+                let arena_len = MEMFS_ARENA.min(psram_size);
+                devices::memfs::init(psram_ptr, arena_len);
+                println!("tmp: arena {} KiB", arena_len / 1024);
+                if psram_size > arena_len {
+                    unsafe {
+                        esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+                            psram_ptr.add(arena_len),
+                            psram_size - arena_len,
+                            esp_alloc::MemoryCapability::External.into(),
+                        ));
+                    }
+                }
+                println!(
+                    "psram: ready ({} KiB heap)",
+                    psram_size.saturating_sub(arena_len) / 1024
+                );
             }
-            println!("psram: ready ({} KiB)", psram_size / 1024);
         } else {
             println!("psram: init failed — running on internal SRAM only");
         }

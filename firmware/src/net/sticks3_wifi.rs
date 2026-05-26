@@ -2,8 +2,10 @@
 
 use esp_radio::wifi::{Config, ControllerConfig};
 
-/// Minimum `set_max_tx_power` (2 dBm) during association.
+/// Minimum `set_max_tx_power` (2 dBm) during association / captive AP.
 pub const TX_POWER_CONNECT: i8 = 8;
+/// Same cap for soft-AP provisioning (RF + L3B must not brown out USB input).
+pub const TX_POWER_AP: i8 = TX_POWER_CONNECT;
 /// Nominal TX after link is up (~13 dBm).
 pub const TX_POWER_RUN: i8 = 52;
 

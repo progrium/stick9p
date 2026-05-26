@@ -164,12 +164,15 @@ The "everything is a filesystem" model collapses every peripheral into a single,
 │   │   └── rssi               # last RSSI
 │   ├── tcp/clone              # open returns new fid pointing at a tcp dir (Plan 9-style)
 │   └── udp/clone
+├── tmp/                       # PSRAM-backed ramfs — dynamic files/dirs (see §5.1)
+│   └── …                      # user-created via Tcreate; not listed statically
 └── sys/
-    ├── hostname               # rw text
+    ├── hostname               # rw text (planned)
     ├── reboot                 # write any byte → reboot
     ├── uptime                 # seconds since boot
-    ├── heap                   # "free=124000 largest=98000\n"
-    ├── cpu                    # "cores=2 mhz=240 temp=46.2\n" (uses ESP32-S3 internal TSENS)
+    ├── heap                   # esp_alloc: `sram free=… used=… total=…` (+ `psram …` when present)
+    ├── tmpfs                  # `/tmp` ramfs: `arena …` + `inodes …` (not esp_alloc — §5.1)
+    ├── cpu                    # "cores=2 mhz=240 temp=46.2\n" (uses ESP32-S3 internal TSENS; planned)
     ├── log                    # streaming defmt/log output (read-only)
     ├── version                # firmware version, git sha, board=sticks3|plus2
     ├── board                  # read-only: "sticks3"|"plus2" (compile-time or efuse-detected)
@@ -184,6 +187,7 @@ The "everything is a filesystem" model collapses every peripheral into a single,
 - **Display text** (`display/ctl`): firmware draws into the same RGB565 `fb` using a single embedded bitmap font (see below). Each `text` command auto-flushes to the panel; mixed `fb` + `text` clients should end with `flush` if ordering matters.
 - `pcm` (mic, speaker): streaming binary; blocks. Backpressure is implemented by deferring `Rread`/`Rwrite` replies — 9P's natural mechanism.
 - Buttons/IR rx/edge files: each `Tread` returns exactly one event line. Multiple readers each see their own event stream via per-fid queues.
+- **`/tmp/*` (ramfs):** seekable regular files and directories backed by a reserved PSRAM arena (see §5.1). Reads past EOF return 0 bytes (not streaming). Binary-safe — no UTF-8 parsing on file payloads.
 - `iounit` (returned in `Ropen`) is sized to fit one logical record (e.g. 6 bytes for one accel sample, 2,048 for `pcm` matching one DMA half-buffer).
 
 #### Display text (`/dev/display/ctl`)
@@ -532,6 +536,7 @@ LED/IMU would have used `impl Node` / `impl Handle` with `embassy_sync::Channel`
 #### Memory budget
 
 - Framebuffer 135 × 240 × 2 = 64,800 bytes → allocate in **PSRAM** (`#[link_section = ".dram2_uninit"]` or `esp_alloc`'s PSRAM allocator). SRAM remains free for stacks.
+- **`/tmp` arena (§5.1, shipped):** **2 MiB** PSRAM slab (StickS3) or **1 MiB** (Plus2), reserved at boot and excluded from `esp_alloc`; inode table (63 user slots + root, SRAM) in `devices/memfs.rs`. **`/sys/tmpfs`** reports arena and inode usage; **`/sys/heap`** does not include `/tmp` file bytes.
 - Per-session 9P buffers: `msize` 4 KiB → 8 KiB RX+TX per session = 16 KiB. Limit to 4 concurrent sessions = 64 KiB.
 - Per-fid state: ~128 bytes. Cap to 256 fids/session.
 - Streaming channels sized 32 samples × 6 bytes ≈ 200 bytes each — negligible.
@@ -539,6 +544,141 @@ LED/IMU would have used `impl Node` / `impl Handle` with `embassy_sync::Channel`
 #### Backpressure & flush
 
 When a streaming sensor's bounded channel fills (e.g. the client is slow), the producer task drops the oldest sample (overwrite-style ring) and increments a `dropped` counter exposed in `/dev/imu/ctl`'s read response. Bulk transfers (`/dev/spk/pcm`) instead use 9P's natural rate-limit: don't ack the `Twrite` until DMA has consumed half the buffer. This makes `cat file.s16 > /dev/spk/pcm` exactly as fast as the speaker plays.
+
+### 5.1 `/tmp` — PSRAM-backed ramfs (shipped)
+
+Expose a **normal in-memory file service** at **`/tmp`** (Plan 9 scratch-space convention). Mounted clients should be able to use familiar host tools without staging through the laptop's `/tmp`:
+
+```sh
+echo hello > /mnt/stick/tmp/greeting
+mkdir /mnt/stick/tmp/capture
+dd if=/mnt/stick/dev/mic/pcm of=/mnt/stick/tmp/capture/clip.s16 bs=32000 count=5
+cat /mnt/stick/tmp/greeting
+rm /mnt/stick/tmp/greeting
+```
+
+This closes a practical gap: mic/speaker workflows today often round-trip through the host filesystem; on-device scratch space keeps scripts entirely on the stick.
+
+#### Why a dedicated service (not “just use the heap”)
+
+PSRAM is also registered in the global `esp_alloc` pool (`/sys/heap` → `psram free=…`). A separate ramfs layer is still warranted:
+
+| Concern | Global heap alone | Dedicated `/tmp` ramfs |
+|---|---|---|
+| **Accounting** | Mixed with framebuffer, fanfare, speaker ring | Fixed arena + inode caps at boot; **`/sys/tmpfs`** for arena/inode `free/used/total` |
+| **Atomics** | Metadata can land in PSRAM → silent UB on ESP32 | **All inode metadata in SRAM**; only byte payloads in PSRAM |
+| **9P semantics** | N/A | Real `Tcreate` / `Tremove`, dynamic `readdir`, offset-aware `Rread`/`Rwrite` |
+| **Predictability** | Fragmentation over long uptime | One arena; delete/truncate returns space to the arena |
+
+`/dev/display/fb` is the right model for a **single fixed blob**; `/tmp` is the right model for **many named, resizable files**.
+
+#### Placement
+
+`/tmp` lives at the **root**, alongside `/dev` and `/sys`, not under `/dev` — it is namespace scratch space, not a peripheral. Only the mount point is static in the tree; all children are created at runtime via `Tcreate`.
+
+#### Architecture (fits §5 shipped layout)
+
+Keep the existing split: static `Node` enum for hardware, dynamic inode table for `/tmp`.
+
+```
+ninep/server.rs     → Tcreate/Tremove/Twalk when fid resolves under MemRoot
+ninep/fs.rs         → static anchor Node::MemRoot only (no per-file enum entries)
+devices/memfs.rs    → inode table (SRAM), data arena (PSRAM), Mutex
+firmware/main.rs    → reserve PSRAM slab after psram init, before heavy Box::leak alloc
+```
+
+**Second fid target** in the session (alongside static `Node`):
+
+```rust
+enum FidTarget {
+    Static(Node),
+    Mem(Ino),   // u16 inode index into memfs
+}
+```
+
+`Twalk` on `Mem(dir)` resolves path components in `memfs`; `Twalk` on `Static` is unchanged. One static mount point, many paths underneath (within caps).
+
+#### Storage model
+
+**Two pools:**
+
+1. **Inode table (SRAM)** — fixed array, compile-time caps per board profile:
+   - `typ`: free / file / dir
+   - `parent`, `name` (`heapless::String<32>` per component)
+   - `size`, `data_off`, `data_len` into the arena
+   - `qid_vers` — bump on unlink/truncate so stale fids fail cleanly
+
+2. **Data arena (PSRAM)** — single contiguous slab carved out at boot, **not** handed to the general `esp_alloc` heap (so display framebuffer and fanfare cannot consume scratch space):
+
+   | Board | Arena (firmware) | Rationale |
+   |---|---|---|
+   | StickS3 | **2 MiB** of ~8 MiB PSRAM | Leave headroom for heap (fanfare, speaker ring, WiFi); arena deferred on captive-portal boot until STA reboot |
+   | Plus2 | **1 MiB** of ~2 MiB PSRAM | Same API, smaller heap slice after arena |
+
+Allocation inside the arena: best-fit or bump+free-list by size class. **No `Atomic*` in arena blocks.** Directory entries are inode indices only (no pointers into PSRAM for metadata).
+
+Boot sequence (after existing PSRAM init in `main.rs`):
+
+```text
+memfs::init(slab_ptr, slab_len) → register remaining PSRAM with esp_alloc::HEAP.add_region
+```
+
+The low slice is the arena; bytes above `arena_len` join the general PSRAM heap. StickS3 **provision boot** skips `memfs::init` and registers all PSRAM as heap until reboot with stored WiFi (`arena unavailable` in `/sys/tmpfs` until then).
+
+#### 9P behavior (“normal” for Linux v9fs)
+
+On static nodes, `Tcreate` still means “open an existing writable node.” Under **`/tmp`**, the server uses `FidTarget::Mem` and `devices/memfs`:
+
+| Op | Behavior |
+|---|---|
+| **Twalk** | `tmp` → `tmp/foo` → `tmp/foo/bar` via inode parent + name lookup |
+| **Tcreate** | Parent must be a `Mem` directory; `perm & DMDIR` → directory, else regular file; initial size 0 |
+| **Topen** | `OTRUNC` truncates file, bumps `qid.vers` |
+| **Tread / Twrite** | Honor **offset** (unlike ctl files today); reads past EOF return 0 |
+| **Tremove** | Unlink; directory must be empty; reject `.` / `..` |
+| **readdir** | Dynamic listing from inode children (not a static `CHILDREN` slice) |
+| **Tstat** | `length` = file size; directories `length = 0` |
+| **Twstat** | v1: `Rerror "not supported"`; v2: rename if needed |
+
+**Not** streaming: no blocking reads, no zero-padding workarounds (contrast `/dev/buttons/event` on some v9fs clients). Binary payloads are never parsed as UTF-8.
+
+**Concurrency:** one `Mutex<MemFs>` around inode table + arena (short critical sections). Multiple readers on one file are fine; v1 documents single-writer per file (typical `dd`/`cp` usage).
+
+#### Example on-stick pipeline
+
+```sh
+echo 'rate 16000' > dev/mic/ctl
+echo start > dev/mic/ctl
+dd if=dev/mic/pcm of=tmp/clip.s16 bs=32000 count=5
+echo stop > dev/mic/ctl
+dd if=tmp/clip.s16 of=dev/spk/pcm bs=4096
+```
+
+#### Phased rollout
+
+| Phase | Deliverable | Status |
+|---|---|---|
+| **1** | Arena + flat files under `/tmp` (`Tcreate` file, seek R/W, `Tremove`, `readdir`) | **Shipped** |
+| **2** | Nested directories (`mkdir` = `Tcreate` with `DMDIR`); empty-dir `Tremove` | **Shipped** |
+| **3** | `Twstat` rename (optional) | Not implemented |
+| **—** | `/sys/tmpfs` arena + inode stats | **Shipped** |
+
+#### Risks and mitigations
+
+| Risk | Mitigation |
+|---|---|
+| PSRAM slow for many small files | Clients use reasonable `bs=`; inode cap limits tiny-file churn |
+| Arena fragmentation | Size buckets, or grow-in-place truncate for same inode |
+| Fid table stores inode index | `FidTarget::Mem(ino)`; `Tclunk` releases fid, not inode |
+| Plus2 2 MiB PSRAM | Same code path, smaller compile-time arena and inode limits |
+
+#### Non-goals (v1)
+
+- Object-safe `dyn Node` VFS (§5 abandoned trait plan)
+- Per-file `Node` enum entries under `/tmp`
+- Inode structs stored in PSRAM
+- Relying on `esp_alloc` for file bytes without a reserved slab
+- Symlinks, hard links, mmap, or execute permission
 
 ---
 
@@ -568,7 +708,7 @@ The 9P tree is **one schema**; nodes are **present, stubbed, or absent** per boa
 
 #### 6.2 VFS adaptation rules
 
-**Always present (both boards):** `/README`, `/ctl`, `/dev/display`, `/dev/imu`, `/dev/buttons`, `/dev/led` (implementation differs), `/dev/gpio`, `/dev/i2c`, `/dev/adc`, `/net`, `/sys`.
+**Always present (both boards):** `/README`, `/ctl`, `/dev/display`, `/dev/imu`, `/dev/buttons`, `/dev/led` (implementation differs), `/dev/gpio`, `/dev/i2c`, `/dev/adc`, `/net`, `/sys`, `/tmp` (ramfs — §5.1), `/sys/tmpfs` (ramfs stats).
 
 | Path | StickS3 | Plus2 |
 |---|---|---|
@@ -583,7 +723,7 @@ The 9P tree is **one schema**; nodes are **present, stubbed, or absent** per boa
 
 **IMU driver swap:** compile-time `#[cfg(feature = "board-plus2")]` → `mpu6886` crate or minimal register peek; `board-sticks3` → `bmi2` + BMI270 blob upload.
 
-**Memory budget (Plus2):** 2 MB PSRAM forces smaller `msize` (4096), fewer concurrent sessions (2), and **no large PSRAM framebuffer** — optional `/dev/display/fb` still 64 KB but allocate in internal RAM only if fit, else line-by-line `ctl region` writes only. `text` still targets the same `fb` (or a line buffer if `fb` is omitted).
+**Memory budget (Plus2):** 2 MB PSRAM forces smaller `msize` (4096), fewer concurrent sessions (2), and **no large PSRAM framebuffer** — optional `/dev/display/fb` still 64 KB but allocate in internal RAM only if fit, else line-by-line `ctl region` writes only. `text` still targets the same `fb` (or a line buffer if `fb` is omitted). `/tmp` arena is ~1 MiB with fewer inodes than StickS3 (§5.1).
 
 **Toolchain:** Plus2 builds with `espup install --targets esp32` and `xtensa-esp32-none-elf`; separate CI matrix row.
 
@@ -623,9 +763,10 @@ The repo's `.local/exp1/` TinyGo firmware targets **Plus2-class ESP32** (`esp32-
 10. Add BLE transport (trouble-host); negotiate `msize=240`.
 11. Add `/net`, `/dev/gpio`, `/dev/i2c/1`, `/dev/adc`. Optional WS bearer token from NVS. **Status (StickS3):** `/dev/i2c/1/{ctl,scan,data}` is live on the Grove port (SDA=G9, SCL=G10); transactions run synchronously inside the 9P session via a `critical_section`-guarded `I2c<Blocking>`. The scan loop holds the CS for one address at a time (~90 µs per NACK) so WiFi RX and audio DMA stay responsive across the ~10 ms probe. `/dev/gpio/<N>/{ctl,level}` exposes the StickS3 Hat2 header (G1..G8) as user-claimable digital I/O — each pin lives in an `esp_hal::gpio::Flex` so `in` ↔ `out` transitions don't tear down the driver. Plus2 has no spare GPIOs (G32/G33 are owned by `/dev/i2c/1`); the tree shows the dirs but `ctl` reads return `absent\n`. `/dev/adc` deferred.
 12. **Plus2 bring-up:** `board-plus2` profile — MPU6886, BM8563, G19 LED, captive portal, HOLD pin, UART 9P.
+13. **`/tmp` ramfs (§5.1):** **Done** — PSRAM arena + `FidTarget::Mem`, `Tcreate`/`Tremove`, nested dirs, seekable R/W, `/sys/tmpfs` stats. Enables on-device staging for mic/spk and general scratch files.
 
 **Stage 5 — Plus2 feature parity (as needed):**
-13. PDM mic, buzzer, IR TX-only; document omitted nodes in `/README`.
+14. PDM mic, buzzer, IR TX-only; document omitted nodes in `/README`.
 
 **Benchmarks / kill criteria:**
 - If 9P latency on WiFi exceeds 20 ms RTT for small files, switch to UDP-based 9P or drop `msize`.

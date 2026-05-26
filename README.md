@@ -14,7 +14,8 @@ Full architecture and hardware targets: [DESIGN.md](DESIGN.md). Open bugs: [ISSU
 | `/dev/buttons/event` | Works; `cat` batches ~16 events (kernel quirk) — [ISSUES.md](ISSUES.md) |
 | `/dev/display/brightness` | On/off only — dimming deferred |
 | `/dev/mic/pcm` | Tree + ctl present; **no capture** (`queued=0`) — [ISSUES.md](ISSUES.md) |
-| StickS3 (`board-sticks3`) | Wi‑Fi + 9P + ST7789P3 display, BMI270 IMU, buttons G11/G12, M5PM1 VBAT, ES8311 + AW8737 **boot fanfare** (staggered bring-up — [ISSUES.md](ISSUES.md)), **`/dev/spk/{ctl,pcm,info}`** + **`/dev/mic/{ctl,pcm}`** @ 16 kHz, `/dev/i2c/1`, `/dev/gpio/1..8`, `/sys/heap`. `/dev/led/*` no‑op ([ISSUES.md](ISSUES.md)) |
+| `/tmp` ramfs | Works (Plus2 + StickS3 after STA boot): nested dirs, seekable files; **`cat sys/tmpfs`** for arena/inode usage (not in `sys/heap`) |
+| StickS3 (`board-sticks3`) | Wi‑Fi + 9P + ST7789P3 display, BMI270 IMU, buttons G11/G12, M5PM1 VBAT, ES8311 + AW8737 **boot fanfare** (staggered bring-up — [ISSUES.md](ISSUES.md)), **`/dev/spk/{ctl,pcm,info}`** + **`/dev/mic/{ctl,pcm}`** @ 16 kHz, `/dev/i2c/1`, `/dev/gpio/1..8`, **`/tmp`**, `/sys/{heap,tmpfs}`. `/dev/led/*` no‑op ([ISSUES.md](ISSUES.md)) |
 
 Firmware version string: `stick9p-0.4.0-stage3-spk` (`cat /mnt/stick/sys/version`).
 
@@ -92,10 +93,14 @@ Use **`msize=4096`** (server caps negotiated size to fit Plus2 buffers). Reads l
 /
 ├── README              # compiled from USAGE.md (full path docs)
 ├── ctl                 # msize, server ctl
+├── tmp/                # PSRAM ramfs — mkdir, cp, rm at runtime
 ├── sys/
 │   ├── board           # plus2
 │   ├── version
 │   ├── uptime
+│   ├── mac, chip
+│   ├── heap            # esp_alloc pools
+│   ├── tmpfs           # /tmp arena + inode stats
 │   └── reboot          # write to reboot
 └── dev/
     ├── led/ctl, state
@@ -108,7 +113,7 @@ Use **`msize=4096`** (server caps negotiated size to fit Plus2 buffers). Reads l
 
 ```
 
-Not on Plus2: `/dev/spk`, IR, M5PM1 power rails, StickS3-only nodes (see DESIGN §6). On StickS3 the tree adds `dev/spk/{ctl,pcm,info}`, `dev/mic/{ctl,pcm}`, `dev/i2c/1`, `dev/gpio/1..8`, `sys/heap` — see [USAGE.md](USAGE.md).
+Not on Plus2: `/dev/spk`, IR, M5PM1 power rails, StickS3-only nodes (see DESIGN §6). On StickS3 the tree adds `dev/spk/{ctl,pcm,info}`, `dev/mic/{ctl,pcm}`, `dev/i2c/1`, `dev/gpio/1..8` — see [USAGE.md](USAGE.md). Both boards expose **`/tmp`** and **`/sys/{heap,tmpfs}`** when PSRAM init succeeds.
 
 ### Examples
 
@@ -135,6 +140,11 @@ cat /mnt/stick/dev/buttons/b
 # Power (ADC battery sense)
 cat /mnt/stick/dev/power/battery
 cat /mnt/stick/dev/power/vbat_mv
+
+# /tmp scratch (PSRAM ramfs)
+mkdir /mnt/stick/tmp/capture
+echo hello > /mnt/stick/tmp/capture/note.txt
+cat /mnt/stick/sys/tmpfs    # arena + inode free/used/total
 
 # Buzzer (GPIO2) — avoid during mic experiments
 echo 'beep 1000 100' | sudo tee /mnt/stick/dev/buzzer/ctl
@@ -188,8 +198,9 @@ After mount, **`cat README`** (or `less README`) serves `USAGE.md` embedded at b
 |-------|-------------|
 | 1 | Wi‑Fi provision, TCP/WS 9P, `/sys/*`, `/dev/led/*` |
 | 2 | Display, IMU, buttons, power, buzzer |
-| 3 | `/dev/mic/*` tree + driver WIP (capture open) |
-| 4+ | StickS3 (ES8311, M5PM1, USB, BLE), host bridge, WAN auth — DESIGN.md |
+| 3 | `/dev/mic/*` tree + driver WIP (capture open); StickS3 spk/mic @ 16 kHz |
+| 3b | `/tmp` ramfs + `/sys/tmpfs` (nested dirs, PSRAM arena) — DESIGN §5.1 |
+| 4+ | StickS3 (USB, BLE), host bridge, WAN auth — DESIGN.md |
 
 ## License
 

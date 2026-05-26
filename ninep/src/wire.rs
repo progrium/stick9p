@@ -12,6 +12,7 @@ pub const RCREATE: u8 = 115;
 pub const RREAD: u8 = 117;
 pub const RWRITE: u8 = 119;
 pub const RCLUNK: u8 = 121;
+pub const RREMOVE: u8 = 123;
 pub const RSTAT: u8 = 125;
 pub const RWSTAT: u8 = 127;
 

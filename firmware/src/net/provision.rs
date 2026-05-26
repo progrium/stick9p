@@ -12,9 +12,13 @@ use embassy_time::{Duration, Instant, Timer, WithTimeout};
 use embedded_io_async::Write;
 use esp_hal::rng::Rng;
 use esp_println::println;
-use esp_radio::wifi::{
-    ap::AccessPointConfig, AuthenticationMethod, Config, ControllerConfig,
-};
+use esp_radio::wifi::{ap::AccessPointConfig, AuthenticationMethod, Config};
+
+#[cfg(not(feature = "board-sticks3"))]
+use esp_radio::wifi::ControllerConfig;
+
+#[cfg(feature = "board-sticks3")]
+use crate::net::sticks3_wifi;
 
 use devices::display;
 
@@ -32,6 +36,9 @@ pub struct ProvisionInfo {
 }
 
 pub async fn run(spawner: &Spawner, wifi: esp_hal::peripherals::WIFI<'static>) -> ! {
+    #[cfg(feature = "board-sticks3")]
+    crate::boot_gate::set_provisioning(true);
+
     let info = ap_credentials();
     println!("provision: AP {} / {}", info.ssid.as_str(), info.password.as_str());
     println!("provision: join AP, open http://192.168.4.1/");
@@ -44,11 +51,24 @@ pub async fn run(spawner: &Spawner, wifi: esp_hal::peripherals::WIFI<'static>) -
             .with_password(info.password.as_str().into()),
     );
 
-    let (_controller, interfaces) = esp_radio::wifi::new(
+    #[cfg(feature = "board-sticks3")]
+    let (mut controller, interfaces) =
+        esp_radio::wifi::new(wifi, sticks3_wifi::controller_config(ap_cfg)).expect("wifi ap");
+    #[cfg(not(feature = "board-sticks3"))]
+    let (mut controller, interfaces) = esp_radio::wifi::new(
         wifi,
         ControllerConfig::default().with_initial_config(ap_cfg),
     )
     .expect("wifi ap");
+
+    #[cfg(feature = "board-sticks3")]
+    {
+        if let Err(e) = controller.set_max_tx_power(sticks3_wifi::TX_POWER_AP) {
+            println!("provision: tx cap err {:?}", e);
+        } else {
+            println!("provision: tx capped for AP (lean buffers)");
+        }
+    }
 
     let gw_addr = Ipv4Address::new(192, 168, 4, 1);
     let mut dns_servers = heapless::Vec::<Ipv4Address, 3>::new();
@@ -75,8 +95,14 @@ pub async fn run(spawner: &Spawner, wifi: esp_hal::peripherals::WIFI<'static>) -
     }
     #[cfg(feature = "board-sticks3")]
     {
+        // Let the AP stack settle before L3B + ST7789 (shared brownout trigger with STA).
+        println!("provision: settling before display rail…");
+        Timer::after(Duration::from_millis(2000)).await;
         println!("boot: network ready (provision AP)");
+        println!("boot: provision mode — amp/fanfare disabled (avoid brownout)");
         crate::boot_gate::signal_network_ready();
+        // Framebuffer was filled before L3B; refresh now that the panel can flush.
+        display::splash_provision(info.ssid.as_str(), info.password.as_str());
     }
     spawner.spawn(dhcp_task(stack).unwrap());
     spawner.spawn(captive_dns(stack).unwrap());
@@ -251,18 +277,31 @@ async fn serve_http(socket: &mut TcpSocket<'_>, tx: &mut [u8], req_buf: &mut [u8
     let n = read_http_request(socket, req_buf).await;
     let req = core::str::from_utf8(&req_buf[..n]).unwrap_or("");
 
-    if req.starts_with("POST /save") {
-        if let Some(body) = req.split("\r\n\r\n").nth(1) {
+    if is_post_save(req) {
+        if let Some(body) = request_body(req) {
             if let Some(cfg) = parse_form(body) {
-                let _ = nvs::save(&cfg);
-                let body = b"Saved. Rebooting...\n";
-                if send_http_response(socket, tx, 200, "text/plain", body).await.is_ok() {
-                    let _ = socket.flush().await;
-                    Timer::after(Duration::from_millis(300)).await;
-                    esp_hal::system::software_reset();
+                match nvs::save(&cfg) {
+                    Ok(()) => {
+                        println!("provision: saved ssid={}", cfg.ssid.as_str());
+                        let body = b"Saved. Rebooting...\n";
+                        let _ = send_http_response(socket, tx, 200, "text/plain", body).await;
+                        let _ = socket.flush().await;
+                        display::splash_booting("rebooting");
+                        Timer::after(Duration::from_millis(500)).await;
+                        println!("provision: software reset");
+                        esp_hal::system::software_reset();
+                    }
+                    Err(()) => {
+                        println!("provision: nvs save failed");
+                        let body = b"Save failed - try again\n";
+                        let _ = send_http_response(socket, tx, 500, "text/plain", body).await;
+                    }
                 }
                 return;
             }
+            println!("provision: bad form body");
+        } else {
+            println!("provision: POST /save missing body");
         }
     }
 
@@ -283,11 +322,11 @@ async fn serve_http(socket: &mut TcpSocket<'_>, tx: &mut [u8], req_buf: &mut [u8
 
 async fn read_http_request(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> usize {
     let mut n = 0usize;
-    let deadline = Instant::now() + Duration::from_millis(800);
+    let deadline = Instant::now() + Duration::from_millis(2500);
     while n < buf.len() && Instant::now() < deadline {
         let chunk = match socket
             .read(&mut buf[n..])
-            .with_timeout(Duration::from_millis(200))
+            .with_timeout(Duration::from_millis(300))
             .await
         {
             Ok(Ok(k)) => k,
@@ -297,14 +336,61 @@ async fn read_http_request(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> usize 
             break;
         }
         n += chunk;
-        if n >= 4 && buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if n > 512 {
+        if request_complete(&buf[..n]) {
             break;
         }
     }
     n
+}
+
+fn is_post_save(req: &str) -> bool {
+    let Some(line) = req.split("\r\n").next() else {
+        return false;
+    };
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    if method != "POST" {
+        return false;
+    }
+    target == "/save"
+        || target.starts_with("/save?")
+        || target.ends_with("/save")
+        || target.contains("/save")
+}
+
+fn request_body<'a>(req: &'a str) -> Option<&'a str> {
+    req.split("\r\n\r\n").nth(1).filter(|b| !b.is_empty())
+}
+
+fn request_complete(buf: &[u8]) -> bool {
+    let Ok(req) = core::str::from_utf8(buf) else {
+        return false;
+    };
+    let Some(headers_end) = req.find("\r\n\r\n") else {
+        return false;
+    };
+    let headers = &req[..headers_end];
+    let body_start = headers_end + 4;
+    let body_len = req.len().saturating_sub(body_start);
+    if let Some(cl) = header_value(headers, "content-length") {
+        if let Ok(need) = cl.trim().parse::<usize>() {
+            return body_len >= need;
+        }
+    }
+    // No Content-Length: enough for GET/HEAD once headers arrived.
+    !is_post_save(req) || body_len > 0
+}
+
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    for line in headers.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim());
+            }
+        }
+    }
+    None
 }
 
 async fn drain_socket(socket: &mut TcpSocket<'_>) {

@@ -18,13 +18,15 @@ Board-specific gaps and open bugs are noted inline; see the repo `ISSUES.md` on 
 /
 ├── README              ← this document
 ├── ctl                 server msize hint
+├── tmp/                PSRAM ramfs — files/dirs via mkdir, cp, rm (runtime)
 ├── sys/
 │   ├── board           "plus2"
 │   ├── version         firmware version string
 │   ├── uptime          milliseconds since boot
 │   ├── mac             base efuse MAC (aa:bb:cc:dd:ee:ff)
 │   ├── chip            model rev cores cpu_mhz
-│   ├── heap            free / used / total bytes
+│   ├── heap            free / used / total bytes (esp_alloc pools)
+│   ├── tmpfs           `/tmp` ramfs arena + inode usage
 │   └── reboot          write anything → reboot
 └── dev/
     ├── led/
@@ -176,6 +178,53 @@ cat sys/heap
 - DMA-capable peripherals usually require SRAM source/destination buffers.
 
 Useful for spotting leaks: `while true; do cat sys/heap; sleep 5; done`. If a pool's `used` keeps climbing rather than oscillating, something is leaking in that pool.
+
+---
+
+## `/sys/tmpfs`
+
+Stats for the **`/tmp` ramfs** (PSRAM arena + SRAM inode table). This is separate from `/sys/heap`: file bytes under `/tmp` do not show up in `psram used=…` there.
+
+```bash
+cat sys/tmpfs
+# arena free=2097152 used=0 total=2097152
+# inodes free=63 used=0 total=63
+```
+
+| Line | Meaning |
+|------|---------|
+| `arena` | PSRAM data slab reserved at boot (`free + used = total`) |
+| `inodes` | Dynamic entries under `/tmp` (root inode not counted; max 63 on current firmware) |
+
+`arena unavailable` means PSRAM `/tmp` was not initialized (e.g. StickS3 captive-portal boot before STA reconnect — `/tmp` appears after reboot with stored WiFi).
+
+Watch `/tmp` fill: `arena used=` grows when you create/write files; `inodes used=` grows with each file or directory name.
+
+---
+
+## `/tmp`
+
+On-device scratch space (Plan 9 convention). The mount shows a `tmp` directory at the root; everything under it is created at runtime.
+
+| Op | How |
+|----|-----|
+| Create file | `echo … > tmp/foo` or `cp` / `dd` |
+| Create dir | `mkdir tmp/capture` (nested paths OK) |
+| List | `ls tmp` / `ls tmp/capture` |
+| Remove file | `rm tmp/foo` |
+| Remove empty dir | `rmdir tmp/capture` |
+| Monitor space | `cat sys/tmpfs` (not `sys/heap`) |
+
+**Limits (current firmware):** up to **63** files or directories (names ≤ 32 bytes); **1 MiB** data arena (Plus2) or **2 MiB** (StickS3). Binary-safe — use for PCM clips, JSON, etc.
+
+```bash
+mkdir tmp/work
+echo test > tmp/work/note.txt
+cat tmp/work/note.txt
+cat sys/tmpfs
+```
+
+StickS3 **captive-portal boot** defers the arena until reboot with stored WiFi — `cat sys/tmpfs` shows `arena unavailable` and `Tcreate` under `tmp` fails until then.
 
 ---
 

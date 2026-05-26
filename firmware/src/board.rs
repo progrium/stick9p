@@ -53,8 +53,8 @@ pub const CHIP_CORES: u8 = {
     }
 };
 
-/// Producers for `/sys/mac`, `/sys/chip`, `/sys/heap`. Each returns a
-/// newline-terminated line sized to fit in a single 9P Tread.
+/// Producers for `/sys/mac`, `/sys/chip`, `/sys/heap`, `/sys/tmpfs`. Each
+/// returns newline-terminated lines sized to fit in a single 9P Tread.
 pub mod sys_info {
     use core::fmt::Write;
     use esp_hal::efuse;
@@ -118,6 +118,28 @@ pub mod sys_info {
                 psram.0, psram.1, psram.2,
             );
         }
+        s
+    }
+
+    /// `/sys/tmpfs` — arena + inode usage for the `/tmp` ramfs (not `esp_alloc`).
+    pub fn tmpfs_line() -> String<96> {
+        let mut s = String::new();
+        if let Some((free, used, total)) = devices::memfs::arena_stats() {
+            let _ = write!(
+                &mut s,
+                "arena free={} used={} total={}\n",
+                free, used, total
+            );
+        } else {
+            let _ = write!(&mut s, "arena unavailable\n");
+        }
+        let (ino_used, ino_total) = devices::memfs::inode_stats();
+        let ino_free = ino_total.saturating_sub(ino_used);
+        let _ = write!(
+            &mut s,
+            "inodes free={} used={} total={}\n",
+            ino_free, ino_used, ino_total
+        );
         s
     }
 }

@@ -27,6 +27,9 @@ pub async fn run(
         Timer::after(embassy_time::Duration::from_millis(300)).await;
     }
 
+    #[cfg(feature = "board-sticks3")]
+    crate::boot_gate::set_provisioning(false);
+
     println!("sta: connecting to {}", cfg.ssid.as_str());
 
     let station = Config::Station(

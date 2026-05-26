@@ -22,6 +22,7 @@ fn fs_context() -> FsContext<'static> {
         sys_mac_line: sys_info::mac_line,
         sys_chip_line: sys_info::chip_line,
         sys_heap_line: sys_info::heap_line,
+        sys_tmpfs_line: sys_info::tmpfs_line,
         led_state_line: led::state_line,
         on_led_ctl: |s| led::handle_ctl(s).map_err(|_| "bad ctl"),
         request_reboot: || {

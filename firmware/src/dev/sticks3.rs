@@ -217,6 +217,11 @@ async fn i2c_task(
     // WiFi runs in `main` until DHCP; then L3B + codec (amp still off).
     crate::boot_gate::wait_network_ready().await;
 
+    if crate::boot_gate::is_provisioning() {
+        let _ = pm.ensure_spk_amp_off();
+        Timer::after(Duration::from_millis(300)).await;
+    }
+
     if pm.enable_l3b().is_err() {
         println!("m5pm1: L3B enable failed (LCD/mic/spk may stay off)");
     } else {
@@ -225,19 +230,29 @@ async fn i2c_task(
     Timer::after(Duration::from_millis(50)).await;
     L3B_READY.signal(());
 
-    let mut es = Es8311 {
-        i2c: RefCellDevice::new(&i2c_cell),
-    };
-    match es.init_16k_mono_from_mclk() {
-        Ok(()) => {
-            Timer::after(Duration::from_millis(20)).await;
-            println!("es8311: programmed (amp off until fanfare)");
+    if crate::boot_gate::is_provisioning() {
+        // No ES8311 bring-up during captive portal: L3B powers the speaker
+        // path but without MCLK/I²S the programmed codec tends to click. Full
+        // init runs after the user saves WiFi and we reboot into STA.
+        println!("es8311: skipped (provision AP)");
+    } else {
+        let mut es = Es8311 {
+            i2c: RefCellDevice::new(&i2c_cell),
+        };
+        match es.init_16k_mono_from_mclk() {
+            Ok(()) => {
+                Timer::after(Duration::from_millis(20)).await;
+                println!("es8311: programmed (amp off until fanfare)");
+            }
+            Err(_) => println!("es8311: init failed"),
         }
-        Err(_) => println!("es8311: init failed"),
     }
     crate::boot_gate::mark_subsystem_ready(crate::boot_gate::SUBSYS_CODEC);
 
     let mut amp_on = false;
+    let mut es = Es8311 {
+        i2c: RefCellDevice::new(&i2c_cell),
+    };
 
     // --- Steady-state poll: IMU at requested rate, VBAT once per second ---
     // Use Option<Instant> so the first iteration always reads VBAT (rather
@@ -245,7 +260,10 @@ async fn i2c_task(
     // boot before 5 s have actually elapsed).
     let mut last_vbat: Option<Instant> = None;
     loop {
-        if !amp_on && crate::boot_gate::boot_is_done() {
+        if !amp_on
+            && crate::boot_gate::boot_is_done()
+            && !crate::boot_gate::is_provisioning()
+        {
             amp_on = true;
             // Unmute DAC (init left DAC_32 at 0x00) then enable AW8737.
             let _ = es.write(es8311_reg::DAC_32, 0xB8);
@@ -332,6 +350,23 @@ where
 
         let drv = self.read_reg(reg::GPIO_DRV)? & !(1 << 2);
         self.write_reg(reg::GPIO_DRV, drv)?;
+        Ok(())
+    }
+
+    /// Hold AW8737 off (PYG3 low) before L3B energizes the speaker rail.
+    fn ensure_spk_amp_off(&mut self) -> Result<(), ()> {
+        let mut func1 = self.read_reg(reg::GPIO_FUNC1).unwrap_or(0);
+        func1 &= !(0b11 << 2);
+        self.write_reg(reg::GPIO_FUNC1, func1)?;
+
+        let mode = self.read_reg(reg::GPIO_MODE)? | (1 << 3);
+        self.write_reg(reg::GPIO_MODE, mode)?;
+
+        let drv = self.read_reg(reg::GPIO_DRV)? & !(1 << 3);
+        self.write_reg(reg::GPIO_DRV, drv)?;
+
+        let out = self.read_reg(reg::GPIO_OUT)? & !(1 << 3);
+        self.write_reg(reg::GPIO_OUT, out)?;
         Ok(())
     }
 
@@ -770,11 +805,16 @@ async fn audio_task(
     use esp_hal::i2s::master::{Config as I2sConfig, DataFormat, I2s};
     use esp_hal::time::Rate;
 
-    // Allocate fanfare PCM before any await so I²S bring-up doesn't also hit the heap.
-    let fanfare_mono: &'static [u8] = Box::leak(build_fanfare_mono_buffer());
-
     // No I²S / amp until codec + display + 9P are up and amp is enabled.
     crate::boot_gate::wait_boot_complete().await;
+    if crate::boot_gate::is_provisioning() {
+        println!("audio: provision mode — I²S/fanfare deferred until STA reboot");
+        loop {
+            Timer::after(Duration::from_secs(3600)).await;
+        }
+    }
+
+    let fanfare_mono: &'static [u8] = Box::leak(build_fanfare_mono_buffer());
     println!("audio: boot complete, waiting for amp");
     crate::boot_gate::wait_amp_ready().await;
     // Let AW8737 + ES8311 unmute settle before MCLK/BCLK start (reduces inrush + USB glitch).

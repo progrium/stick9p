@@ -19,6 +19,8 @@ pub const PATH_SYS_REBOOT: u64 = 8;
 pub const PATH_SYS_MAC: u64 = 45;
 pub const PATH_SYS_CHIP: u64 = 46;
 pub const PATH_SYS_HEAP: u64 = 47;
+pub const PATH_SYS_TMPFS: u64 = 48;
+pub const PATH_TMP: u64 = 200;
 pub const PATH_DEV: u64 = 9;
 pub const PATH_DEV_LED: u64 = 10;
 pub const PATH_DEV_LED_CTL: u64 = 11;
@@ -97,10 +99,18 @@ const GPIO_DIR_CHILDREN: &[Node] = &[
     Node::DevGpioPin(8),
 ];
 
+/// Fid binding: static tree node or `/tmp` ramfs inode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FidTarget {
+    Static(Node),
+    Mem(u16),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Node {
     Root,
     Readme,
+    MemRoot,
     Ctl,
     Sys,
     SysBoard,
@@ -110,6 +120,7 @@ pub enum Node {
     SysMac,
     SysChip,
     SysHeap,
+    SysTmpfs,
     Dev,
     DevLed,
     DevLedCtl,
@@ -157,6 +168,7 @@ impl Node {
     pub fn from_path(path: u64) -> Option<Self> {
         Some(match path {
             PATH_ROOT => Node::Root,
+            PATH_TMP => Node::MemRoot,
             PATH_README => Node::Readme,
             PATH_CTL => Node::Ctl,
             PATH_SYS => Node::Sys,
@@ -167,6 +179,7 @@ impl Node {
             PATH_SYS_MAC => Node::SysMac,
             PATH_SYS_CHIP => Node::SysChip,
             PATH_SYS_HEAP => Node::SysHeap,
+            PATH_SYS_TMPFS => Node::SysTmpfs,
             PATH_DEV => Node::Dev,
             PATH_DEV_LED => Node::DevLed,
             PATH_DEV_LED_CTL => Node::DevLedCtl,
@@ -220,6 +233,7 @@ impl Node {
     pub fn qid(self) -> Qid {
         let (typ, path) = match self {
             Node::Root
+            | Node::MemRoot
             | Node::Sys
             | Node::Dev
             | Node::DevLed
@@ -246,6 +260,7 @@ impl Node {
     pub fn path(self) -> u64 {
         match self {
             Node::Root => PATH_ROOT,
+            Node::MemRoot => PATH_TMP,
             Node::Readme => PATH_README,
             Node::Ctl => PATH_CTL,
             Node::Sys => PATH_SYS,
@@ -256,6 +271,7 @@ impl Node {
             Node::SysMac => PATH_SYS_MAC,
             Node::SysChip => PATH_SYS_CHIP,
             Node::SysHeap => PATH_SYS_HEAP,
+            Node::SysTmpfs => PATH_SYS_TMPFS,
             Node::Dev => PATH_DEV,
             Node::DevLed => PATH_DEV_LED,
             Node::DevLedCtl => PATH_DEV_LED_CTL,
@@ -302,6 +318,7 @@ impl Node {
     pub fn name(self) -> &'static str {
         match self {
             Node::Root => "/",
+            Node::MemRoot => "tmp",
             Node::Readme => "README",
             Node::Ctl => "ctl",
             Node::Sys => "sys",
@@ -312,6 +329,7 @@ impl Node {
             Node::SysMac => "mac",
             Node::SysChip => "chip",
             Node::SysHeap => "heap",
+            Node::SysTmpfs => "tmpfs",
             Node::Dev => "dev",
             Node::DevLed => "led",
             Node::DevLedCtl => "ctl",
@@ -357,7 +375,7 @@ impl Node {
 
     pub fn mode(self) -> u32 {
         match self {
-            Node::Root | Node::Sys | Node::Dev | Node::DevLed | Node::DevDisplay
+            Node::Root | Node::MemRoot | Node::Sys | Node::Dev | Node::DevLed | Node::DevDisplay
             | Node::DevImu
             | Node::DevButtons
             | Node::DevPower
@@ -412,6 +430,7 @@ impl Node {
         match (self, name) {
             (Node::Root, "README") => Some(Node::Readme),
             (Node::Root, "ctl") => Some(Node::Ctl),
+            (Node::Root, "tmp") => Some(Node::MemRoot),
             (Node::Root, "sys") => Some(Node::Sys),
             (Node::Root, "dev") => Some(Node::Dev),
             (Node::Sys, "board") => Some(Node::SysBoard),
@@ -421,6 +440,7 @@ impl Node {
             (Node::Sys, "mac") => Some(Node::SysMac),
             (Node::Sys, "chip") => Some(Node::SysChip),
             (Node::Sys, "heap") => Some(Node::SysHeap),
+            (Node::Sys, "tmpfs") => Some(Node::SysTmpfs),
             (Node::Dev, "led") => Some(Node::DevLed),
             (Node::Dev, "display") => Some(Node::DevDisplay),
             (Node::Dev, "imu") => Some(Node::DevImu),
@@ -473,7 +493,7 @@ impl Node {
 
     pub fn children(self) -> &'static [Node] {
         match self {
-            Node::Root => &[Node::Readme, Node::Ctl, Node::Sys, Node::Dev],
+            Node::Root => &[Node::Readme, Node::Ctl, Node::MemRoot, Node::Sys, Node::Dev],
             Node::Sys => &[
                 Node::SysBoard,
                 Node::SysVersion,
@@ -482,6 +502,7 @@ impl Node {
                 Node::SysMac,
                 Node::SysChip,
                 Node::SysHeap,
+                Node::SysTmpfs,
             ],
             Node::Dev => &[
                 Node::DevLed,
@@ -544,6 +565,8 @@ pub struct FsContext<'a> {
     /// `/sys/heap` — one line per region (`sram free=… used=… total=…\n`,
     /// `psram free=… used=… total=…\n`).
     pub sys_heap_line: fn() -> heapless::String<160>,
+    /// `/sys/tmpfs` — `arena …` and `inodes …` lines for `/tmp` ramfs.
+    pub sys_tmpfs_line: fn() -> heapless::String<96>,
     pub led_state_line: fn() -> heapless::String<32>,
     pub on_led_ctl: fn(&str) -> Result<(), &'static str>,
     pub request_reboot: fn(),
@@ -594,6 +617,7 @@ impl<'a> Default for FsContext<'a> {
             sys_mac_line: heapless::String::new,
             sys_chip_line: heapless::String::new,
             sys_heap_line: heapless::String::new,
+            sys_tmpfs_line: heapless::String::new,
             led_state_line: || heapless::String::new(),
             on_led_ctl: |_| Err("no led"),
             request_reboot: || {},
@@ -725,6 +749,10 @@ pub fn read_file(node: Node, ctx: &FsContext<'_>, off: u64, buf: &mut [u8]) -> u
             let line = (ctx.sys_heap_line)();
             return copy_string(line.as_str(), off, buf);
         }
+        Node::SysTmpfs => {
+            let line = (ctx.sys_tmpfs_line)();
+            return copy_string(line.as_str(), off, buf);
+        }
         Node::DevLedState => {
             let line = (ctx.led_state_line)();
             let _ = s.push_str(line.as_str());
@@ -797,6 +825,121 @@ pub fn write_file(node: Node, ctx: &FsContext<'_>, off: u64, data: &[u8]) -> Res
         Node::DevGpioPinLevel(pin) => (ctx.on_gpio_level)(pin, s).map(|_| data.len()),
         _ => Err("permission denied"),
     }
+}
+
+impl FidTarget {
+    pub fn from_static(node: Node) -> Self {
+        Self::Static(node)
+    }
+
+    pub fn qid(self) -> Qid {
+        match self {
+            FidTarget::Static(n) => n.qid(),
+            FidTarget::Mem(ino) => Qid {
+                typ: devices::memfs::qid_typ(ino),
+                vers: devices::memfs::qid_vers(ino),
+                path: devices::memfs::qid_path(ino),
+            },
+        }
+    }
+
+    pub fn mode(self) -> u32 {
+        match self {
+            FidTarget::Static(n) => n.mode(),
+            FidTarget::Mem(ino) => devices::memfs::mode(ino),
+        }
+    }
+
+    pub fn length(self) -> u64 {
+        match self {
+            FidTarget::Static(n) => n.length(),
+            FidTarget::Mem(ino) => devices::memfs::length(ino),
+        }
+    }
+
+    pub fn name(self) -> heapless::String<32> {
+        match self {
+            FidTarget::Static(n) => {
+                let mut s = heapless::String::new();
+                let _ = s.push_str(n.name());
+                s
+            }
+            FidTarget::Mem(ino) => devices::memfs::name(ino),
+        }
+    }
+
+    pub fn is_dir(self) -> bool {
+        match self {
+            FidTarget::Static(n) => n == Node::MemRoot || !n.children().is_empty(),
+            FidTarget::Mem(ino) => devices::memfs::is_dir(ino),
+        }
+    }
+
+    pub fn walk(self, name: &str) -> Option<Self> {
+        match self {
+            FidTarget::Static(n) => {
+                let next = n.walk(name)?;
+                if next == Node::MemRoot {
+                    Some(FidTarget::Mem(devices::memfs::ROOT_INO))
+                } else {
+                    Some(FidTarget::Static(next))
+                }
+            }
+            FidTarget::Mem(ino) => {
+                let child = devices::memfs::walk(ino, name)?;
+                Some(FidTarget::Mem(child))
+            }
+        }
+    }
+}
+
+/// Map a static tree node to a fid target (`MemRoot` → ramfs root inode).
+pub fn static_target(node: Node) -> FidTarget {
+    if node == Node::MemRoot {
+        FidTarget::Mem(devices::memfs::ROOT_INO)
+    } else {
+        FidTarget::Static(node)
+    }
+}
+
+pub fn pack_mem_dir_list(parent: u16, off: u64, buf: &mut [u8]) -> usize {
+    let mut written = 0usize;
+    let mut skip = off as usize;
+    let count = devices::memfs::child_count(parent);
+    for i in 0..count {
+        let Some(ino) = devices::memfs::child_ino_at(parent, i) else {
+            break;
+        };
+        let q = QidWire {
+            typ: devices::memfs::qid_typ(ino),
+            vers: devices::memfs::qid_vers(ino),
+            path: devices::memfs::qid_path(ino),
+        };
+        let name = devices::memfs::name(ino);
+        let mut tmp = [0u8; 160];
+        let mut o = 0usize;
+        crate::wire::encode_stat(
+            &mut tmp,
+            &mut o,
+            q,
+            devices::memfs::mode(ino),
+            devices::memfs::length(ino),
+            name.as_str(),
+        );
+        if skip >= o {
+            skip -= o;
+            continue;
+        }
+        let start = skip;
+        skip = 0;
+        let slice = &tmp[start..o];
+        if written + slice.len() > buf.len() {
+            break;
+        }
+        buf[written..written + slice.len()].copy_from_slice(slice);
+        written += slice.len();
+    }
+    written
 }
 
 pub fn pack_dir_list(node: Node, off: u64, buf: &mut [u8]) -> usize {
