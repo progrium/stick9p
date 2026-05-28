@@ -5,6 +5,11 @@ version.workspace = true
 license.workspace = true
 description = "Stick device drivers and shared state"
 
+[features]
+default = ["wamr"]
+wamr = ["dep:wamr-sys"]
+
 [dependencies]
 critical-section = "1.2.0"
 heapless = "0.8"
+wamr-sys = { path = "../wamr-sys", optional = true }

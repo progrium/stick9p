@@ -2,6 +2,7 @@
 
 pub mod gpio;
 pub mod i2c1;
+pub mod wasm_core;
 
 #[cfg(feature = "board-plus2")]
 mod mic;

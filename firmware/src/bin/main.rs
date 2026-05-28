@@ -7,6 +7,7 @@ use embassy_executor::Spawner;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::peripherals::CPU_CTRL;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 
@@ -204,6 +205,17 @@ async fn main(spawner: Spawner) -> ! {
             println!("psram: init failed — running on internal SRAM only");
         }
         embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
+
+        match devices::wasm::preinit_runtime_heap() {
+            Ok(()) => println!(
+                "wasm: pool reserved ({} KiB) — `echo \"exec /tmp/<file>.wasm\" > /ctl`",
+                devices::wasm::POOL_BYTES / 1024
+            ),
+            Err(e) => println!("wasm: pool reserve failed: {}", e),
+        }
+
+        let cpu_ctrl: CPU_CTRL<'static> = unsafe { core::mem::transmute(peripherals.CPU_CTRL) };
+        firmware::dev::wasm_core::start(cpu_ctrl, sw_interrupt.software_interrupt1);
     }
 
     #[cfg(not(feature = "board-sticks3"))]
@@ -214,6 +226,19 @@ async fn main(spawner: Spawner) -> ! {
 
     #[cfg(not(feature = "board-sticks3"))]
     firmware::boot_gate::wait_devices_ready().await;
+
+    #[cfg(not(feature = "board-sticks3"))]
+    {
+        match devices::wasm::preinit_runtime_heap() {
+            Ok(()) => println!(
+                "wasm: pool reserved ({} KiB) — `echo \"exec /tmp/<file>.wasm\" > /ctl`",
+                devices::wasm::POOL_BYTES / 1024
+            ),
+            Err(e) => println!("wasm: pool reserve failed: {}", e),
+        }
+        let cpu_ctrl: CPU_CTRL<'static> = unsafe { core::mem::transmute(peripherals.CPU_CTRL) };
+        firmware::dev::wasm_core::start(cpu_ctrl, sw_interrupt.software_interrupt1);
+    }
 
     if let Some(cfg) = nvs::load() {
         if cfg.is_valid() {

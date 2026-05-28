@@ -4,6 +4,7 @@ members = [
     "firmware",
     "ninep",
     "devices",
+    "wamr-sys",
 ]
 exclude = ["tools/stick9p-bridge"]
 

@@ -606,6 +606,9 @@ pub struct FsContext<'a> {
     /// `/dev/gpio/<N>/level` reads — refresh the cached input level (if
     /// the pin is configured as input) and return it.
     pub refresh_gpio_level: fn(u8),
+    /// `/ctl` writes — `msize <N>` is accepted (no-op) and `exec <path>`
+    /// kicks off a wasm run with `path` resolved under `/tmp`.
+    pub on_root_ctl: fn(&str) -> Result<(), &'static str>,
 }
 
 impl<'a> Default for FsContext<'a> {
@@ -646,8 +649,21 @@ impl<'a> Default for FsContext<'a> {
             on_gpio_ctl: |_, _| Err("no gpio on this board"),
             on_gpio_level: |_, _| Err("no gpio on this board"),
             refresh_gpio_level: |_| {},
+            on_root_ctl: |_| Err("bad ctl"),
         }
     }
+}
+
+/// Render the `/ctl` read body — server hint plus current wasm state.
+pub fn ctl_status_line() -> heapless::String<256> {
+    let mut s = heapless::String::<256>::new();
+    let _ = s.push_str("msize=4096\n");
+    #[cfg(feature = "wamr")]
+    {
+        let wasm = devices::wasm::status_line();
+        let _ = s.push_str(wasm.as_str());
+    }
+    s
 }
 
 pub fn is_writable(node: Node) -> bool {
@@ -758,7 +774,8 @@ pub fn read_file(node: Node, ctx: &FsContext<'_>, off: u64, buf: &mut [u8]) -> u
             let _ = s.push_str(line.as_str());
         }
         Node::Ctl => {
-            let _ = s.push_str("msize=4096\n");
+            let line = ctl_status_line();
+            return copy_string(line.as_str(), off, buf);
         }
         Node::DevDisplayInfo => {
             let _ = s.push_str("st7789v2 135x240 rgb565 le\n");
@@ -810,7 +827,7 @@ pub fn write_file(node: Node, ctx: &FsContext<'_>, off: u64, data: &[u8]) -> Res
             (ctx.request_reboot)();
             Ok(data.len())
         }
-        Node::Ctl if s.starts_with("msize ") => Ok(data.len()),
+        Node::Ctl => (ctx.on_root_ctl)(s).map(|_| data.len()),
         Node::DevDisplayCtl => (ctx.on_display_ctl)(s).map(|_| data.len()),
         Node::DevDisplayBrightness => (ctx.on_display_brightness)(s).map(|_| data.len()),
         Node::DevImuCtl => (ctx.on_imu_ctl)(s).map(|_| data.len()),

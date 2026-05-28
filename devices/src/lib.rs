@@ -12,3 +12,5 @@ pub mod memfs;
 pub mod mic;
 pub mod power;
 pub mod spk;
+#[cfg(feature = "wamr")]
+pub mod wasm;

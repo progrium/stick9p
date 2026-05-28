@@ -18,3 +18,4 @@ esp-println = { version = "0.17", optional = true, default-features = false }
 default = ["server"]
 server = ["dep:embedded-io-async", "dep:embassy-time", "dep:embassy-futures"]
 log = ["dep:esp-println"]
+wamr = ["devices/wamr"]

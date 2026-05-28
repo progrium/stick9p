@@ -56,7 +56,26 @@ fn fs_context() -> FsContext<'static> {
         on_gpio_ctl: crate::dev::gpio::on_ctl,
         on_gpio_level: crate::dev::gpio::on_level,
         refresh_gpio_level: crate::dev::gpio::refresh_level,
+        on_root_ctl,
     }
+}
+
+/// `/ctl` writes — `msize <N>` is a no-op (we always negotiate via
+/// Tversion); `exec <path>` arms a wasm run on core 1 and the 9P session
+/// defers the Rwrite until [`devices::wasm::is_busy`] clears.
+fn on_root_ctl(line: &str) -> Result<(), &'static str> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(());
+    }
+    if let Some(rest) = line.strip_prefix("msize ") {
+        let _ = rest;
+        return Ok(());
+    }
+    if let Some(rest) = line.strip_prefix("exec ") {
+        return devices::wasm::exec(rest.trim());
+    }
+    Err("bad ctl")
 }
 
 /// Sink for `/dev/spk/pcm` writes. StickS3 fills the ring buffer for the

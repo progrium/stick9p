@@ -1,5 +1,8 @@
 #![no_std]
 
+#[cfg(all(feature = "board-plus2", feature = "board-sticks3"))]
+compile_error!("enable only one board feature: use --no-default-features --features board-plus2 or board-sticks3");
+
 extern crate alloc;
 
 pub mod board;

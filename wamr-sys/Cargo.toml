@@ -1,0 +1,21 @@
+[package]
+name = "wamr-sys"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "WAMR (WebAssembly Micro Runtime) FFI for Stick firmware"
+
+[dependencies]
+
+[features]
+default = []
+std = []
+
+[build-dependencies]
+bindgen = "0.71"
+cc = "1.2"
+cmake = "0.1"
+
+[[example]]
+name = "run_demo"
+required-features = ["std"]

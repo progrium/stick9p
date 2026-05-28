@@ -274,11 +274,10 @@ pub fn splash_ready(ip: &str) {
         fill_fb(fb, 0, 0, 0);
         draw_text_scaled(fb, 4, 8, 0x00, 0xff, 0x00, "READY", 2);
         let mut line = heapless::String::<48>::new();
-        let _ = line.push_str("ip:  ");
         let _ = line.push_str(ip);
         draw_text_scaled(fb, 4, 40, 0xff, 0xff, 0xff, line.as_str(), 1);
-        draw_text_scaled(fb, 4, 56, 0xa0, 0xa0, 0xa0, "9p tcp/564", 1);
-        draw_text_scaled(fb, 4, 72, 0xa0, 0xa0, 0xa0, "ws  /9p:8080", 1);
+        draw_text_scaled(fb, 4, 72, 0xa0, 0xa0, 0xa0, "9p tcp/564", 1);
+        draw_text_scaled(fb, 4, 88, 0xa0, 0xa0, 0xa0, "ws  /9p:8080", 1);
         st.dirty = true;
     });
 }

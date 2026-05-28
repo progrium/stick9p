@@ -17,8 +17,10 @@ Board-specific gaps and open bugs are noted inline; see the repo `ISSUES.md` on 
 ```
 /
 ├── README              ← this document
-├── ctl                 server msize hint
+├── ctl                 server msize hint + wasm status; `exec <path>` runs wasm
 ├── tmp/                PSRAM ramfs — files/dirs via mkdir, cp, rm (runtime)
+│                        wasm modules: `cp foo.wasm /tmp && echo "exec /tmp/foo.wasm" > /ctl`
+│                        stdout/errors land in `/tmp/exec.log`
 ├── sys/
 │   ├── board           "plus2"
 │   ├── version         firmware version string
@@ -72,14 +74,17 @@ Board-specific gaps and open bugs are noted inline; see the repo `ISSUES.md` on 
 
 ## `/ctl`
 
-Server control (read for hints; limited write support).
+Server control. Reads return the negotiated msize hint and the wasm runner state.
 
 | Read | Write |
 |------|-------|
-| `msize=4096\n` | `msize <N>` (accepted; server still caps at 4096) |
+| `msize=4096\nwasm <idle\|running <name>\|done <name>\|failed <name>: <msg>>\n` | `msize <N>` (no-op, msize is negotiated via Tversion) |
+| | `exec <path>` — run a wasm under `/tmp/`; the Rwrite reply is held until the guest finishes, so the client `echo > /ctl` returns only when output is ready under `/tmp/exec.log` |
 
 ```bash
-cat ctl
+cat ctl                                  # msize=4096 / wasm idle
+echo 'exec /tmp/zigcheck.wasm' > ctl     # blocks until guest exits
+cat tmp/exec.log                         # captured stdout (or `wasm error: …`)
 ```
 
 ---
@@ -225,6 +230,37 @@ cat sys/tmpfs
 ```
 
 StickS3 **captive-portal boot** defers the arena until reboot with stored WiFi — `cat sys/tmpfs` shows `arena unavailable` and `Tcreate` under `tmp` fails until then.
+
+---
+
+## WASM exec (experimental)
+
+The device ships **no embedded guest** — you copy a WASI preview1 module into `/tmp`, then run it from the root `/ctl` file. WAMR runs on **CPU core 1** so I²S/9P on core 0 keep polling. The Rwrite reply for `exec` is held until the guest exits, so a synchronous `echo > ctl` blocks for the run.
+
+```bash
+# 1. Push the wasm into the device ramfs (see `tmp/` section above).
+cp wasm/zig/zigcheck.wasm /mnt/9p/tmp/zigcheck.wasm
+# or: cp wasm/tinygo/gocheck.wasm /mnt/9p/tmp/gocheck.wasm
+
+# 2. Run it. The shell blocks until the guest exits.
+echo 'exec /tmp/zigcheck.wasm' > /mnt/9p/ctl
+
+# 3. Captured stdout (or `wasm error: …`) lives in /tmp/exec.log.
+cat /mnt/9p/tmp/exec.log
+```
+
+`exec <path>` requires `path` to resolve under `/tmp`; nested directories are supported. argv[0] is the wasm basename (extension stripped); the remaining static argv/env are set in `devices/src/wasm.rs`. The WAMR pool (`wamr_sys::RUNTIME_HEAP_BYTES`, currently 5 MiB) must be ≥ guest `--max-memory` + ~1 MiB; check `cat /sys/heap` for `psram free=` before running.
+
+Two sample guests live in this repo; both target WASI preview1 and write to stdout:
+
+```bash
+cd wasm/zig    && make build   # produces zigcheck.wasm (~37 KiB)
+cd wasm/tinygo && make build   # produces gocheck.wasm  (~220 KiB)
+```
+
+The Zig and TinyGo samples print the same `Dir / Args / Env / Root` shape, so they're useful for diffing host behavior across guests.
+
+**Firmware build deps:** `git submodule update --init` (WAMR in `third_party/wasm-micro-runtime`), **cmake** on the host that compiles firmware.
 
 ---
 

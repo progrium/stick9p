@@ -11,7 +11,7 @@ name = "firmware"
 path = "./src/bin/main.rs"
 
 [features]
-default = ["board-plus2"]
+default = ["board-sticks3"]
 board-plus2 = [
   "esp-backtrace/esp32",
   "esp-bootloader-esp-idf/esp32",
@@ -34,8 +34,8 @@ board-sticks3 = [
 ]
 
 [dependencies]
-devices = { path = "../devices" }
-ninep = { path = "../ninep", features = ["server", "log"] }
+devices = { path = "../devices", features = ["wamr"] }
+ninep = { path = "../ninep", features = ["server", "log", "wamr"] }
 
 esp-hal = { version = "~1.1.0", features = ["unstable"] }
 esp-rtos = { version = "0.3.0", features = [
