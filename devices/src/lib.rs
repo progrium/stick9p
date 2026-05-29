@@ -13,4 +13,9 @@ pub mod mic;
 pub mod power;
 pub mod spk;
 #[cfg(feature = "wamr")]
-pub mod wasm;
+pub mod task;
+
+#[cfg(feature = "wamr")]
+pub mod wasm {
+    pub use super::task::*;
+}

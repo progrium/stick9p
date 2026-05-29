@@ -60,7 +60,13 @@ fn c_string_table_env(strings: &[&str]) -> alloc::vec::Vec<alloc::ffi::CString> 
 /// Run a WASI module (`_start`); guest stdout/stderr are captured.
 ///
 /// On failure, writes a NUL-terminated message into `err` (if non-empty).
-pub fn run(wasm: &[u8], argv: &[&str], env: &[&str], err: &mut [u8]) -> Result<&'static str, ()> {
+pub fn run(
+    wasm: &[u8],
+    argv: &[&str],
+    env: &[&str],
+    preopen_dir: &str,
+    err: &mut [u8],
+) -> Result<&'static str, ()> {
     if !err.is_empty() {
         err[0] = 0;
     }
@@ -80,6 +86,7 @@ pub fn run(wasm: &[u8], argv: &[&str], env: &[&str], err: &mut [u8]) -> Result<&
         let mut argv_ptrs: Vec<*mut c_char> =
             c_argv.iter().map(|s| s.as_ptr() as *mut c_char).collect();
         let mut env_ptrs: Vec<*const c_char> = c_env.iter().map(|s| s.as_ptr()).collect();
+        let c_preopen = std::ffi::CString::new(preopen_dir).unwrap_or_else(|_| std::ffi::CString::new(".").unwrap());
         unsafe {
             stick_wamr_run(
                 wasm.as_ptr(),
@@ -88,6 +95,7 @@ pub fn run(wasm: &[u8], argv: &[&str], env: &[&str], err: &mut [u8]) -> Result<&
                 argv.len() as u32,
                 env_ptrs.as_mut_ptr(),
                 env.len() as u32,
+                c_preopen.as_ptr(),
                 err_buf.as_mut_ptr() as *mut c_char,
                 err_buf.len() as u32,
             )
@@ -102,6 +110,8 @@ pub fn run(wasm: &[u8], argv: &[&str], env: &[&str], err: &mut [u8]) -> Result<&
             c_argv.iter().map(|s| s.as_ptr() as *mut c_char).collect();
         let env_ptrs: alloc::vec::Vec<*const c_char> =
             c_env.iter().map(|s| s.as_ptr()).collect();
+        let c_preopen = alloc::ffi::CString::new(preopen_dir)
+            .unwrap_or_else(|_| alloc::ffi::CString::new(".").unwrap());
         unsafe {
             stick_wamr_run(
                 wasm.as_ptr(),
@@ -110,6 +120,7 @@ pub fn run(wasm: &[u8], argv: &[&str], env: &[&str], err: &mut [u8]) -> Result<&
                 argv.len() as u32,
                 env_ptrs.as_ptr() as *mut *const c_char,
                 env.len() as u32,
+                c_preopen.as_ptr(),
                 err_buf.as_mut_ptr() as *mut c_char,
                 err_buf.len() as u32,
             )

@@ -21,6 +21,12 @@ pub const PATH_SYS_CHIP: u64 = 46;
 pub const PATH_SYS_HEAP: u64 = 47;
 pub const PATH_SYS_TMPFS: u64 = 48;
 pub const PATH_TMP: u64 = 200;
+pub const PATH_TASK: u64 = 90;
+pub const PATH_TASK_ALLOC: u64 = 91;
+/// `/task/<rid>/` directory qid paths (`rid` 1..=8).
+pub const PATH_TASK_DIR_BASE: u64 = 100;
+/// `/task/<rid>/<file>` qid paths: `PATH_TASK_FILE_BASE + (rid-1)*8 + kind`.
+pub const PATH_TASK_FILE_BASE: u64 = 200;
 pub const PATH_DEV: u64 = 9;
 pub const PATH_DEV_LED: u64 = 10;
 pub const PATH_DEV_LED_CTL: u64 = 11;
@@ -162,6 +168,51 @@ pub enum Node {
     DevGpioPin(u8),
     DevGpioPinCtl(u8),
     DevGpioPinLevel(u8),
+    /// `/task` — wasm runner task namespace.
+    Task,
+    TaskAlloc,
+    /// `/task/<rid>/` directory.
+    TaskDir(u8),
+    /// File under `/task/<rid>/` (`ctl`, `cmd`, …).
+    TaskFile(u8, TaskFileKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskFileKind {
+    Ctl = 0,
+    Cmd = 1,
+    WorkDir = 2,
+    Env = 3,
+    Id = 4,
+    Exit = 5,
+    Data = 6,
+}
+
+impl TaskFileKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ctl => "ctl",
+            Self::Cmd => "cmd",
+            Self::WorkDir => "dir",
+            Self::Env => "env",
+            Self::Id => "id",
+            Self::Exit => "exit",
+            Self::Data => "data",
+        }
+    }
+
+    fn from_index(i: u64) -> Option<Self> {
+        Some(match i {
+            0 => Self::Ctl,
+            1 => Self::Cmd,
+            2 => Self::WorkDir,
+            3 => Self::Env,
+            4 => Self::Id,
+            5 => Self::Exit,
+            6 => Self::Data,
+            _ => return None,
+        })
+    }
 }
 
 impl Node {
@@ -226,6 +277,17 @@ impl Node {
             p if (PATH_DEV_GPIO_PIN_LEVEL_BASE..PATH_DEV_GPIO_PIN_LEVEL_BASE + 16).contains(&p) => {
                 Node::DevGpioPinLevel((p - PATH_DEV_GPIO_PIN_LEVEL_BASE) as u8 + 1)
             }
+            PATH_TASK => Node::Task,
+            PATH_TASK_ALLOC => Node::TaskAlloc,
+            p if (PATH_TASK_DIR_BASE + 1..PATH_TASK_DIR_BASE + 9).contains(&p) => {
+                Node::TaskDir((p - PATH_TASK_DIR_BASE) as u8)
+            }
+            p if p >= PATH_TASK_FILE_BASE && p < PATH_TASK_FILE_BASE + 64 => {
+                let off = p - PATH_TASK_FILE_BASE;
+                let rid = (off / 8 + 1) as u8;
+                let kind = TaskFileKind::from_index(off % 8)?;
+                Node::TaskFile(rid, kind)
+            }
             _ => return None,
         })
     }
@@ -246,7 +308,9 @@ impl Node {
             | Node::DevSpk
             | Node::DevI2c
             | Node::DevI2c1
-            | Node::DevGpio => (QT_DIR, self.path()),
+            | Node::DevGpio
+            | Node::Task
+            | Node::TaskDir(_) => (QT_DIR, self.path()),
             Node::DevGpioPin(_) => (QT_DIR, self.path()),
             _ => (QT_FILE, self.path()),
         };
@@ -312,7 +376,37 @@ impl Node {
             Node::DevGpioPin(n) => PATH_DEV_GPIO_PIN_BASE + (n.saturating_sub(1)) as u64,
             Node::DevGpioPinCtl(n) => PATH_DEV_GPIO_PIN_CTL_BASE + (n.saturating_sub(1)) as u64,
             Node::DevGpioPinLevel(n) => PATH_DEV_GPIO_PIN_LEVEL_BASE + (n.saturating_sub(1)) as u64,
+            Node::Task => PATH_TASK,
+            Node::TaskAlloc => PATH_TASK_ALLOC,
+            Node::TaskDir(rid) => PATH_TASK_DIR_BASE + rid as u64,
+            Node::TaskFile(rid, kind) => {
+                PATH_TASK_FILE_BASE + (rid as u64 - 1) * 8 + kind as u64
+            }
         }
+    }
+
+    pub fn is_dir(self) -> bool {
+        matches!(
+            self,
+            Node::Root
+                | Node::MemRoot
+                | Node::Sys
+                | Node::Dev
+                | Node::DevLed
+                | Node::DevDisplay
+                | Node::DevImu
+                | Node::DevButtons
+                | Node::DevPower
+                | Node::DevBuzzer
+                | Node::DevMic
+                | Node::DevSpk
+                | Node::DevI2c
+                | Node::DevI2c1
+                | Node::DevGpio
+                | Node::DevGpioPin(_)
+                | Node::Task
+                | Node::TaskDir(_)
+        )
     }
 
     pub fn name(self) -> &'static str {
@@ -370,6 +464,10 @@ impl Node {
             Node::DevGpioPin(n) => gpio_pin_name(n),
             Node::DevGpioPinCtl(_) => "ctl",
             Node::DevGpioPinLevel(_) => "level",
+            Node::Task => "task",
+            Node::TaskAlloc => "alloc",
+            Node::TaskDir(_) => "?",
+            Node::TaskFile(_, kind) => kind.name(),
         }
     }
 
@@ -388,9 +486,15 @@ impl Node {
                 0x80000000 | 0o555
             }
             Node::DevGpioPin(_) => 0x80000000 | 0o555,
+            Node::Task | Node::TaskDir(_) => 0x80000000 | 0o555,
             Node::DevLedCtl
             | Node::Ctl
             | Node::SysReboot
+            | Node::TaskFile(_, TaskFileKind::Ctl)
+            | Node::TaskFile(_, TaskFileKind::Cmd)
+            | Node::TaskFile(_, TaskFileKind::WorkDir)
+            | Node::TaskFile(_, TaskFileKind::Env)
+            | Node::TaskFile(_, TaskFileKind::Data)
             | Node::DevDisplayCtl
             | Node::DevDisplayBrightness
             | Node::DevDisplayFb
@@ -416,6 +520,21 @@ impl Node {
             // Streaming files: large fake length prevents v9fs page cache from
             // returning EOF based on i_size=0 before data is available.
             Node::DevBtnEvent | Node::DevMicPcm | Node::DevSpkPcm => u32::MAX as u64,
+            Node::TaskFile(rid, TaskFileKind::Data) => task_data_len(rid),
+            #[cfg(feature = "wamr")]
+            Node::TaskFile(rid, TaskFileKind::Cmd) => {
+                devices::task::field_len(rid, devices::task::TaskField::Cmd)
+            }
+            #[cfg(feature = "wamr")]
+            Node::TaskFile(rid, TaskFileKind::WorkDir) => {
+                devices::task::field_len(rid, devices::task::TaskField::Dir)
+            }
+            #[cfg(feature = "wamr")]
+            Node::TaskFile(rid, TaskFileKind::Env) => {
+                devices::task::field_len(rid, devices::task::TaskField::Env)
+            }
+            #[cfg(feature = "wamr")]
+            Node::TaskFile(_rid, TaskFileKind::Id) => 2,
             _ => 0,
         }
     }
@@ -425,11 +544,16 @@ impl Node {
             return Some(self);
         }
         if name == ".." {
-            return Some(Node::Root);
+            return match self {
+                Node::TaskDir(_) | Node::TaskAlloc => Some(Node::Task),
+                Node::Task => Some(Node::Root),
+                _ => Some(Node::Root),
+            };
         }
         match (self, name) {
             (Node::Root, "README") => Some(Node::Readme),
             (Node::Root, "ctl") => Some(Node::Ctl),
+            (Node::Root, "task") => Some(Node::Task),
             (Node::Root, "tmp") => Some(Node::MemRoot),
             (Node::Root, "sys") => Some(Node::Sys),
             (Node::Root, "dev") => Some(Node::Dev),
@@ -487,13 +611,34 @@ impl Node {
             (Node::DevSpk, "ctl") => Some(Node::DevSpkCtl),
             (Node::DevSpk, "pcm") => Some(Node::DevSpkPcm),
             (Node::DevSpk, "info") => Some(Node::DevSpkInfo),
+            (Node::Task, "alloc") => Some(Node::TaskAlloc),
+            (Node::Task, name) => {
+                let rid: u8 = name.parse().ok()?;
+                if devices::task::exists(rid) {
+                    Some(Node::TaskDir(rid))
+                } else {
+                    None
+                }
+            }
+            (Node::TaskDir(rid), "ctl") => Some(Node::TaskFile(rid, TaskFileKind::Ctl)),
+            (Node::TaskDir(rid), "cmd") => Some(Node::TaskFile(rid, TaskFileKind::Cmd)),
+            (Node::TaskDir(rid), "dir") => Some(Node::TaskFile(rid, TaskFileKind::WorkDir)),
+            (Node::TaskDir(rid), "env") => Some(Node::TaskFile(rid, TaskFileKind::Env)),
+            (Node::TaskDir(rid), "id") => Some(Node::TaskFile(rid, TaskFileKind::Id)),
+            (Node::TaskDir(rid), "exit") => Some(Node::TaskFile(rid, TaskFileKind::Exit)),
+            (Node::TaskDir(rid), "data") => Some(Node::TaskFile(rid, TaskFileKind::Data)),
             _ => None,
         }
     }
 
+    pub fn uses_custom_dir_list(self) -> bool {
+        matches!(self, Node::Task | Node::TaskDir(_))
+    }
+
     pub fn children(self) -> &'static [Node] {
         match self {
-            Node::Root => &[Node::Readme, Node::Ctl, Node::MemRoot, Node::Sys, Node::Dev],
+            Node::Root => &[Node::Readme, Node::Ctl, Node::Task, Node::MemRoot, Node::Sys, Node::Dev],
+            Node::Task => &[Node::TaskAlloc],
             Node::Sys => &[
                 Node::SysBoard,
                 Node::SysVersion,
@@ -606,8 +751,8 @@ pub struct FsContext<'a> {
     /// `/dev/gpio/<N>/level` reads — refresh the cached input level (if
     /// the pin is configured as input) and return it.
     pub refresh_gpio_level: fn(u8),
-    /// `/ctl` writes — `msize <N>` is accepted (no-op) and `exec <path>`
-    /// kicks off a wasm run with `path` resolved under `/tmp`.
+    /// `/ctl` writes — `msize <N>` is accepted (no-op) and `exec <path> [args…]`
+    /// allocates a task and sets `cmd` (does not start; see `/task/<rid>/ctl`).
     pub on_root_ctl: fn(&str) -> Result<(), &'static str>,
 }
 
@@ -660,7 +805,7 @@ pub fn ctl_status_line() -> heapless::String<256> {
     let _ = s.push_str("msize=4096\n");
     #[cfg(feature = "wamr")]
     {
-        let wasm = devices::wasm::status_line();
+        let wasm = devices::task::status_line();
         let _ = s.push_str(wasm.as_str());
     }
     s
@@ -687,6 +832,11 @@ pub fn is_writable(node: Node) -> bool {
             | Node::DevI2c1Data
             | Node::DevGpioPinCtl(_)
             | Node::DevGpioPinLevel(_)
+            | Node::TaskFile(_, TaskFileKind::Ctl)
+            | Node::TaskFile(_, TaskFileKind::Cmd)
+            | Node::TaskFile(_, TaskFileKind::WorkDir)
+            | Node::TaskFile(_, TaskFileKind::Env)
+            | Node::TaskFile(_, TaskFileKind::Data)
     )
 }
 
@@ -777,6 +927,10 @@ pub fn read_file(node: Node, ctx: &FsContext<'_>, off: u64, buf: &mut [u8]) -> u
             let line = ctl_status_line();
             return copy_string(line.as_str(), off, buf);
         }
+        #[cfg(feature = "wamr")]
+        Node::TaskAlloc => return devices::task::alloc_read(off, buf),
+        #[cfg(feature = "wamr")]
+        Node::TaskFile(rid, kind) => return read_task_file(rid, kind, off, buf),
         Node::DevDisplayInfo => {
             let _ = s.push_str("st7789v2 135x240 rgb565 le\n");
         }
@@ -828,6 +982,31 @@ pub fn write_file(node: Node, ctx: &FsContext<'_>, off: u64, data: &[u8]) -> Res
             Ok(data.len())
         }
         Node::Ctl => (ctx.on_root_ctl)(s).map(|_| data.len()),
+        #[cfg(feature = "wamr")]
+        Node::TaskFile(rid, TaskFileKind::Ctl) => {
+            devices::task::write_ctl(rid, s).map(|_| data.len())
+        }
+        #[cfg(feature = "wamr")]
+        Node::TaskFile(rid, TaskFileKind::Cmd) => devices::task::write_field(
+            rid,
+            devices::task::TaskField::Cmd,
+            off,
+            data,
+        ),
+        #[cfg(feature = "wamr")]
+        Node::TaskFile(rid, TaskFileKind::WorkDir) => devices::task::write_field(
+            rid,
+            devices::task::TaskField::Dir,
+            off,
+            data,
+        ),
+        #[cfg(feature = "wamr")]
+        Node::TaskFile(rid, TaskFileKind::Env) => devices::task::write_field(
+            rid,
+            devices::task::TaskField::Env,
+            off,
+            data,
+        ),
         Node::DevDisplayCtl => (ctx.on_display_ctl)(s).map(|_| data.len()),
         Node::DevDisplayBrightness => (ctx.on_display_brightness)(s).map(|_| data.len()),
         Node::DevImuCtl => (ctx.on_imu_ctl)(s).map(|_| data.len()),
@@ -887,7 +1066,7 @@ impl FidTarget {
 
     pub fn is_dir(self) -> bool {
         match self {
-            FidTarget::Static(n) => n == Node::MemRoot || !n.children().is_empty(),
+            FidTarget::Static(n) => n.is_dir(),
             FidTarget::Mem(ino) => devices::memfs::is_dir(ino),
         }
     }
@@ -997,6 +1176,124 @@ fn copy_string(s: &str, off: u64, buf: &mut [u8]) -> usize {
     let n = (bytes.len() - start).min(buf.len());
     buf[..n].copy_from_slice(&bytes[start..start + n]);
     n
+}
+
+#[cfg(feature = "wamr")]
+fn read_task_file(rid: u8, kind: TaskFileKind, off: u64, buf: &mut [u8]) -> usize {
+    use devices::task::TaskField;
+    match kind {
+        TaskFileKind::Id => devices::task::read_id(rid, off, buf),
+        TaskFileKind::Exit => devices::task::read_exit(rid, off, buf),
+        TaskFileKind::Data => devices::task::read_data(rid, off, buf),
+        TaskFileKind::Cmd => devices::task::read_field(rid, TaskField::Cmd, off, buf),
+        TaskFileKind::WorkDir => devices::task::read_field(rid, TaskField::Dir, off, buf),
+        TaskFileKind::Env => devices::task::read_field(rid, TaskField::Env, off, buf),
+        TaskFileKind::Ctl => 0,
+    }
+}
+
+#[cfg(feature = "wamr")]
+fn task_data_len(rid: u8) -> u64 {
+    devices::task::data_out_len(rid)
+}
+
+#[cfg(feature = "wamr")]
+pub fn pack_task_root_dir_list(off: u64, buf: &mut [u8]) -> usize {
+    let mut written = 0usize;
+    let mut skip = off as usize;
+    let mut pack_one = |node: Node, name: &str| -> bool {
+        let q = QidWire {
+            typ: node.qid().typ,
+            vers: 0,
+            path: node.path(),
+        };
+        let mut tmp = [0u8; 128];
+        let mut o = 0usize;
+        crate::wire::encode_stat(&mut tmp, &mut o, q, node.mode(), node.length(), name);
+        if skip >= o {
+            skip -= o;
+            return true;
+        }
+        let start = skip;
+        skip = 0;
+        let slice = &tmp[start..o];
+        if written + slice.len() > buf.len() {
+            return false;
+        }
+        buf[written..written + slice.len()].copy_from_slice(slice);
+        written += slice.len();
+        true
+    };
+    if !pack_one(Node::TaskAlloc, "alloc") {
+        return written;
+    }
+    let mut rids = heapless::Vec::<u8, 32>::new();
+    devices::task::list_rids(&mut rids);
+    for &rid in rids.iter() {
+        let mut name = heapless::String::<4>::new();
+        push_rid_name(&mut name, rid);
+        let node = Node::TaskDir(rid);
+        if !pack_one(node, name.as_str()) {
+            break;
+        }
+    }
+    written
+}
+
+#[cfg(feature = "wamr")]
+fn push_rid_name(name: &mut heapless::String<4>, rid: u8) {
+    if rid >= 10 {
+        let _ = name.push((b'0' + rid / 10) as char);
+        let _ = name.push((b'0' + rid % 10) as char);
+    } else {
+        let _ = name.push((b'0' + rid) as char);
+    }
+}
+
+#[cfg(feature = "wamr")]
+pub fn pack_task_dir_list(rid: u8, off: u64, buf: &mut [u8]) -> usize {
+    const KINDS: [TaskFileKind; 7] = [
+        TaskFileKind::Ctl,
+        TaskFileKind::Cmd,
+        TaskFileKind::WorkDir,
+        TaskFileKind::Env,
+        TaskFileKind::Id,
+        TaskFileKind::Exit,
+        TaskFileKind::Data,
+    ];
+    let mut written = 0usize;
+    let mut skip = off as usize;
+    for kind in KINDS {
+        let node = Node::TaskFile(rid, kind);
+        let q = QidWire {
+            typ: node.qid().typ,
+            vers: 0,
+            path: node.path(),
+        };
+        let mut tmp = [0u8; 128];
+        let mut o = 0usize;
+        crate::wire::encode_stat(
+            &mut tmp,
+            &mut o,
+            q,
+            node.mode(),
+            node.length(),
+            kind.name(),
+        );
+        if skip >= o {
+            skip -= o;
+            continue;
+        }
+        let start = skip;
+        skip = 0;
+        let slice = &tmp[start..o];
+        if written + slice.len() > buf.len() {
+            break;
+        }
+        buf[written..written + slice.len()].copy_from_slice(slice);
+        written += slice.len();
+    }
+    written
 }
 
 fn u64_to_str(mut n: u64) -> heapless::String<32> {

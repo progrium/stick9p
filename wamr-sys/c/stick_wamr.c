@@ -187,8 +187,8 @@ runtime_init_once(void)
 
 int
 stick_wamr_run(const uint8_t *wasm_bytes, uint32_t wasm_len, char *argv[],
-               uint32_t argc, const char *env[], uint32_t env_count, char *err,
-               uint32_t err_len)
+               uint32_t argc, const char *env[], uint32_t env_count,
+               const char *preopen_dir, char *err, uint32_t err_len)
 {
     wasm_module_t module = NULL;
     wasm_module_inst_t module_inst = NULL;
@@ -196,7 +196,8 @@ stick_wamr_run(const uint8_t *wasm_bytes, uint32_t wasm_len, char *argv[],
     uint8_t *wasm_copy = NULL;
     LoadArgs load_args;
 #if WASM_ENABLE_LIBC_WASI != 0
-    const char *dir_list[WASI_DIR_COUNT] = { "." };
+    const char *dir_default = ".";
+    const char *dir_list[WASI_DIR_COUNT];
     static char argv_bufs[STICK_MAX_ARGV][STICK_STR_LEN];
     static char *argv_copy[STICK_MAX_ARGV];
     static char env_bufs[STICK_MAX_ENV][STICK_STR_LEN];
@@ -237,6 +238,10 @@ stick_wamr_run(const uint8_t *wasm_bytes, uint32_t wasm_len, char *argv[],
     }
 
 #if WASM_ENABLE_LIBC_WASI != 0
+    if (!preopen_dir || preopen_dir[0] == '\0') {
+        preopen_dir = dir_default;
+    }
+    dir_list[0] = preopen_dir;
     if (copy_wasi_str_table(argv_bufs, argv_copy, argv, argc, STICK_MAX_ARGV) != 0
         || copy_wasi_str_table(env_bufs, env_copy, (char **)env, env_count,
                                STICK_MAX_ENV)

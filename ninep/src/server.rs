@@ -22,8 +22,6 @@ macro_rules! ninep_log {
 
 const MAX_FIDS: usize = 32;
 const EVENT_POLL_MS: u64 = 25;
-/// While a WASM guest runs on core 1, poll often so the audio task keeps draining I²S DMA.
-const WASM_POLL_MS: u64 = 2;
 
 struct PendingStreamRead {
     tag: u16,
@@ -41,14 +39,6 @@ enum PendingKind {
     MicPcm,
 }
 
-/// Deferred Rwrite for `/ctl exec <path>` while WAMR runs on core 1.
-#[cfg(feature = "wamr")]
-struct PendingExec {
-    tag: u16,
-    fid: u32,
-    write_len: u32,
-}
-
 enum DispatchResult {
     Reply(usize),
     WaitStream {
@@ -57,12 +47,6 @@ enum DispatchResult {
         count: u32,
         fid: u32,
         offset: u64,
-    },
-    #[cfg(feature = "wamr")]
-    WaitExec {
-        tag: u16,
-        fid: u32,
-        write_len: u32,
     },
 }
 
@@ -87,8 +71,6 @@ pub struct Session<'a, S> {
     fids: [FidSlot; MAX_FIDS],
     storage: &'a mut SessionStorage,
     pending_stream: Option<(PendingKind, PendingStreamRead)>,
-    #[cfg(feature = "wamr")]
-    pending_exec: Option<PendingExec>,
     btn_poll_count: u32,
 }
 
@@ -105,8 +87,6 @@ where
             storage,
             btn_poll_count: 0,
             pending_stream: None,
-            #[cfg(feature = "wamr")]
-            pending_exec: None,
         }
     }
 
@@ -146,26 +126,6 @@ where
                 }
             }
 
-            #[cfg(feature = "wamr")]
-            if let Some(p) = self.pending_exec.as_ref() {
-                if !devices::wasm::is_busy() {
-                    ninep_log!("9p: exec done — sending deferred Rwrite (tag={})", p.tag);
-                    let reply_len =
-                        build_write_reply(&mut self.storage.tx, p.tag, p.write_len);
-                    if write_all(&mut self.stream, &self.storage.tx[..reply_len])
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    let _ = flush_stream(&mut self.stream).await;
-                    self.pending_exec = None;
-                    continue;
-                }
-                Timer::after(Duration::from_millis(WASM_POLL_MS)).await;
-                continue;
-            }
-
             let timeout_ms = if self.pending_stream.is_some() {
                 EVENT_POLL_MS
             } else {
@@ -203,19 +163,6 @@ where
                     self.pending_stream =
                         Some((kind, PendingStreamRead { tag, count, fid, offset }));
                 }
-                #[cfg(feature = "wamr")]
-                DispatchResult::WaitExec {
-                    tag,
-                    fid,
-                    write_len,
-                } => {
-                    ninep_log!("9p: WaitExec tag={} len={}", tag, write_len);
-                    self.pending_exec = Some(PendingExec {
-                        tag,
-                        fid,
-                        write_len,
-                    });
-                }
             }
         }
     }
@@ -252,14 +199,6 @@ where
                     .is_some_and(|(_, p)| p.tag == oldtag)
                 {
                     self.pending_stream = None;
-                }
-                #[cfg(feature = "wamr")]
-                if self
-                    .pending_exec
-                    .as_ref()
-                    .is_some_and(|p| p.tag == oldtag)
-                {
-                    self.pending_exec = None;
                 }
                 let out = &mut self.storage.tx;
                 let mut o = 0usize;
@@ -645,7 +584,11 @@ where
             FidTarget::Static(Node::DevBtnEvent) => buttons::try_read_event(offset, data),
             FidTarget::Static(Node::DevMicPcm) => mic::try_read_pcm(offset, data),
             FidTarget::Static(Node::MemRoot) => fs::pack_mem_dir_list(devices::memfs::ROOT_INO, offset, data),
-            FidTarget::Static(node) if !node.children().is_empty() => {
+            #[cfg(feature = "wamr")]
+            FidTarget::Static(Node::Task) => fs::pack_task_root_dir_list(offset, data),
+            #[cfg(feature = "wamr")]
+            FidTarget::Static(Node::TaskDir(rid)) => fs::pack_task_dir_list(rid, offset, data),
+            FidTarget::Static(node) if !node.children().is_empty() && !node.uses_custom_dir_list() => {
                 fs::pack_dir_list(node, offset, data)
             }
             FidTarget::Static(node) => fs::read_file(node, &self.ctx, offset, data),
@@ -767,6 +710,19 @@ where
                     )))
                 }
             },
+            #[cfg(feature = "wamr")]
+            FidTarget::Static(Node::TaskFile(rid, fs::TaskFileKind::Data)) => {
+                match devices::task::write_data(rid, offset, data) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return Ok(DispatchResult::Reply(write_rerror(
+                            &mut self.storage.tx,
+                            tag,
+                            e,
+                        )))
+                    }
+                }
+            }
             FidTarget::Static(node) => match fs::write_file(node, &self.ctx, offset, data) {
                 Ok(n) => n,
                 Err(e) => {
@@ -778,17 +734,6 @@ where
                 }
             },
         };
-        // `/ctl exec <path>` arms a WAMR run on core 1. Defer the Rwrite until
-        // the guest finishes so the client write blocks (same UX as the old
-        // `/x/wasm` read-blocks-while-busy path).
-        #[cfg(feature = "wamr")]
-        if matches!(target, FidTarget::Static(Node::Ctl)) && devices::wasm::is_busy() {
-            return Ok(DispatchResult::WaitExec {
-                tag,
-                fid,
-                write_len: n as u32,
-            });
-        }
         Ok(DispatchResult::Reply(build_write_reply(
             &mut self.storage.tx,
             tag,
@@ -805,11 +750,6 @@ where
         if self.pending_stream.as_ref().map_or(false, |(_, p)| p.fid == fid) {
             ninep_log!("9p: cancel pending stream fid={}", fid);
             self.pending_stream = None;
-        }
-        #[cfg(feature = "wamr")]
-        if self.pending_exec.as_ref().map_or(false, |p| p.fid == fid) {
-            ninep_log!("9p: cancel pending exec fid={}", fid);
-            self.pending_exec = None;
         }
         let out = &mut self.storage.tx;
         let mut o = 0usize;

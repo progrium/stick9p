@@ -17,10 +17,19 @@ Board-specific gaps and open bugs are noted inline; see the repo `ISSUES.md` on 
 ```
 /
 ├── README              ← this document
-├── ctl                 server msize hint + wasm status; `exec <path>` runs wasm
+├── ctl                 server msize hint + wasm status; `exec …` allocates a task (does not start)
+├── task/               wasm runner tasks (configure → start → poll exit/data)
+│   ├── alloc           read @ offset 0 → `<rid>\n` (side effect; works with `cat`)
+│   └── <rid>/
+│       ├── id          read-only task id
+│       ├── cmd         `/tmp/foo.wasm arg1 …` (argv[0]=basename; `/tmp/` only)
+│       ├── env         newline `KEY=VAL` lines
+│       ├── dir         working directory (default `.`; WASI preopen when wired)
+│       ├── ctl         write `start` once (returns immediately)
+│       ├── exit        read `""` while running; `0\n` / `-1\n` when done (persists)
+│       └── data        read combined stdout+stderr; write stdin (errors if exited)
 ├── tmp/                PSRAM ramfs — files/dirs via mkdir, cp, rm (runtime)
-│                        wasm modules: `cp foo.wasm /tmp && echo "exec /tmp/foo.wasm" > /ctl`
-│                        stdout/errors land in `/tmp/exec.log`
+│                        wasm modules: `cp foo.wasm tmp/ && echo "exec /tmp/foo.wasm" > ctl`
 ├── sys/
 │   ├── board           "plus2"
 │   ├── version         firmware version string
@@ -78,13 +87,16 @@ Server control. Reads return the negotiated msize hint and the wasm runner state
 
 | Read | Write |
 |------|-------|
-| `msize=4096\nwasm <idle\|running <name>\|done <name>\|failed <name>: <msg>>\n` | `msize <N>` (no-op, msize is negotiated via Tversion) |
-| | `exec <path>` — run a wasm under `/tmp/`; the Rwrite reply is held until the guest finishes, so the client `echo > /ctl` returns only when output is ready under `/tmp/exec.log` |
+| `msize=4096\nwasm <idle\|configured rid=N\|running …\|done …\|failed …>\n` | `msize <N>` (no-op, msize is negotiated via Tversion) |
+| | `exec <path> [args…]` — allocate a task and set `cmd` under `/tmp/` (does **not** start; see `/task`) |
 
 ```bash
 cat ctl                                  # msize=4096 / wasm idle
-echo 'exec /tmp/zigcheck.wasm' > ctl     # blocks until guest exits
-cat tmp/exec.log                         # captured stdout (or `wasm error: …`)
+echo 'exec /tmp/zigcheck.wasm' > ctl     # returns immediately; status shows configured rid=
+cat ctl                                  # wasm configured rid=1
+echo start > task/1/ctl                  # start the run (non-blocking)
+cat task/1/exit                          # poll until 0\n or -1\n
+cat task/1/data                          # combined stdout+stderr
 ```
 
 ---
@@ -233,23 +245,44 @@ StickS3 **captive-portal boot** defers the arena until reboot with stored WiFi �
 
 ---
 
-## WASM exec (experimental)
+## WASM tasks (experimental)
 
-The device ships **no embedded guest** — you copy a WASI preview1 module into `/tmp`, then run it from the root `/ctl` file. WAMR runs on **CPU core 1** so I²S/9P on core 0 keep polling. The Rwrite reply for `exec` is held until the guest exits, so a synchronous `echo > ctl` blocks for the run.
+The device ships **no embedded guest** — copy a WASI preview1 module into `/tmp`, configure a task, then `start` it. WAMR runs on **CPU core 1** so I²S/9P on core 0 keep polling. Only **one task runs at a time**; starting a second task while the runner is busy returns an error.
+
+### Quick path via `/ctl exec`
 
 ```bash
-# 1. Push the wasm into the device ramfs (see `tmp/` section above).
 cp wasm/zig/zigcheck.wasm /mnt/9p/tmp/zigcheck.wasm
-# or: cp wasm/tinygo/gocheck.wasm /mnt/9p/tmp/gocheck.wasm
-
-# 2. Run it. The shell blocks until the guest exits.
-echo 'exec /tmp/zigcheck.wasm' > /mnt/9p/ctl
-
-# 3. Captured stdout (or `wasm error: …`) lives in /tmp/exec.log.
-cat /mnt/9p/tmp/exec.log
+echo 'exec /tmp/zigcheck.wasm' > /mnt/9p/ctl   # allocate + set cmd (immediate)
+cat /mnt/9p/ctl                                 # wasm configured rid=1
+echo start > /mnt/9p/task/1/ctl
+while [ -z "$(cat /mnt/9p/task/1/exit)" ]; do sleep 0.05; done
+cat /mnt/9p/task/1/data
 ```
 
-`exec <path>` requires `path` to resolve under `/tmp`; nested directories are supported. argv[0] is the wasm basename (extension stripped); the remaining static argv/env are set in `devices/src/wasm.rs`. The WAMR pool (`wamr_sys::RUNTIME_HEAP_BYTES`, currently 5 MiB) must be ≥ guest `--max-memory` + ~1 MiB; check `cat /sys/heap` for `psram free=` before running.
+### Explicit `/task` flow
+
+```bash
+rid=$(cat /mnt/9p/task/alloc)                   # read @ offset 0 only
+echo '/tmp/zigcheck.wasm arg1 "arg two"' > /mnt/9p/task/$rid/cmd
+echo start > /mnt/9p/task/$rid/ctl
+cat /mnt/9p/task/$rid/exit                      # 0\n success, -1\n error
+cat /mnt/9p/task/$rid/data
+```
+
+| File | Notes |
+|------|-------|
+| `task/alloc` | Every read at offset 0 allocates a new slot (`cat` works). |
+| `cmd` | Path must start with `/tmp/`; argv[0] is basename (`.wasm` stripped). Space-split args; double quotes for spaces. |
+| `dir` | Working directory for the guest (default `.`). Writable only before `start`. |
+| `env` | Newline-separated `KEY=VAL` lines. Writable only before `start`. |
+| `ctl` | Write `start` once; returns immediately. Errors if runner busy or already started. |
+| `exit` | Empty while pending/running; `0\n` or `-1\n` after exit (persists). |
+| `data` | Read combined stdout+stderr. Write stdin while running (errors after exit). |
+
+`exec <path> [args…]` is shorthand for alloc + `cmd`. Check `cat ctl` for `wasm configured rid=N` or runner state (`running`, `done`, `failed`).
+
+The WAMR pool (`wamr_sys::RUNTIME_HEAP_BYTES`, currently 5 MiB) must be ≥ guest `--max-memory` + ~1 MiB; check `cat sys/heap` for `psram free=` before running.
 
 Two sample guests live in this repo; both target WASI preview1 and write to stdout:
 

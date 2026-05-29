@@ -243,6 +243,7 @@ fn main() {
         argc: u32,
         env: *const *const ::core::ffi::c_char,
         env_count: u32,
+        preopen_dir: *const ::core::ffi::c_char,
         err: *mut ::core::ffi::c_char,
         err_len: u32,
     ) -> i32;

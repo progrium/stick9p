@@ -61,8 +61,7 @@ fn fs_context() -> FsContext<'static> {
 }
 
 /// `/ctl` writes — `msize <N>` is a no-op (we always negotiate via
-/// Tversion); `exec <path>` arms a wasm run on core 1 and the 9P session
-/// defers the Rwrite until [`devices::wasm::is_busy`] clears.
+/// Tversion); `exec <path>` allocates a task and sets `cmd` (does not start).
 fn on_root_ctl(line: &str) -> Result<(), &'static str> {
     let line = line.trim();
     if line.is_empty() {
@@ -73,7 +72,7 @@ fn on_root_ctl(line: &str) -> Result<(), &'static str> {
         return Ok(());
     }
     if let Some(rest) = line.strip_prefix("exec ") {
-        return devices::wasm::exec(rest.trim());
+        return devices::task::exec_configure(rest.trim());
     }
     Err("bad ctl")
 }
