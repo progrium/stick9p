@@ -14,5 +14,8 @@ mod readme;
 #[cfg(feature = "server")]
 pub mod fs;
 
+#[cfg(all(feature = "server", feature = "wamr"))]
+pub mod vfs_ffi;
+
 #[cfg(feature = "server")]
 pub mod server;

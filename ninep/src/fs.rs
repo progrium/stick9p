@@ -21,12 +21,14 @@ pub const PATH_SYS_CHIP: u64 = 46;
 pub const PATH_SYS_HEAP: u64 = 47;
 pub const PATH_SYS_TMPFS: u64 = 48;
 pub const PATH_TMP: u64 = 200;
-pub const PATH_TASK: u64 = 90;
-pub const PATH_TASK_ALLOC: u64 = 91;
+/// Task qid paths — kept outside `/dev/gpio/*/level` (80–95) and `/tmp` (200).
+pub const PATH_TASK: u64 = 96;
+pub const PATH_TASK_ALLOC: u64 = 97;
 /// `/task/<rid>/` directory qid paths (`rid` 1..=8).
 pub const PATH_TASK_DIR_BASE: u64 = 100;
-/// `/task/<rid>/<file>` qid paths: `PATH_TASK_FILE_BASE + (rid-1)*8 + kind`.
-pub const PATH_TASK_FILE_BASE: u64 = 200;
+/// `/task/<rid>/<file>` qid paths: `PATH_TASK_FILE_BASE + (rid-1)*9 + kind`.
+pub const PATH_TASK_FILE_BASE: u64 = 264;
+pub const TASK_FILES_PER_RID: u64 = 9;
 pub const PATH_DEV: u64 = 9;
 pub const PATH_DEV_LED: u64 = 10;
 pub const PATH_DEV_LED_CTL: u64 = 11;
@@ -186,6 +188,7 @@ pub enum TaskFileKind {
     Id = 4,
     Exit = 5,
     Data = 6,
+    Status = 7,
 }
 
 impl TaskFileKind {
@@ -198,10 +201,11 @@ impl TaskFileKind {
             Self::Id => "id",
             Self::Exit => "exit",
             Self::Data => "data",
+            Self::Status => "status",
         }
     }
 
-    fn from_index(i: u64) -> Option<Self> {
+    pub const fn from_index(i: u64) -> Option<Self> {
         Some(match i {
             0 => Self::Ctl,
             1 => Self::Cmd,
@@ -210,6 +214,7 @@ impl TaskFileKind {
             4 => Self::Id,
             5 => Self::Exit,
             6 => Self::Data,
+            7 => Self::Status,
             _ => return None,
         })
     }
@@ -268,6 +273,19 @@ impl Node {
             PATH_DEV_I2C_1_SCAN => Node::DevI2c1Scan,
             PATH_DEV_I2C_1_DATA => Node::DevI2c1Data,
             PATH_DEV_GPIO => Node::DevGpio,
+            PATH_TASK => Node::Task,
+            PATH_TASK_ALLOC => Node::TaskAlloc,
+            p if (PATH_TASK_DIR_BASE + 1..PATH_TASK_DIR_BASE + 9).contains(&p) => {
+                Node::TaskDir((p - PATH_TASK_DIR_BASE) as u8)
+            }
+            p if p >= PATH_TASK_FILE_BASE
+                && p < PATH_TASK_FILE_BASE + TASK_FILES_PER_RID * 8 =>
+            {
+                let off = p - PATH_TASK_FILE_BASE;
+                let rid = (off / TASK_FILES_PER_RID + 1) as u8;
+                let kind = TaskFileKind::from_index(off % TASK_FILES_PER_RID)?;
+                Node::TaskFile(rid, kind)
+            }
             p if (PATH_DEV_GPIO_PIN_BASE..PATH_DEV_GPIO_PIN_CTL_BASE).contains(&p) => {
                 Node::DevGpioPin((p - PATH_DEV_GPIO_PIN_BASE) as u8 + 1)
             }
@@ -276,17 +294,6 @@ impl Node {
             }
             p if (PATH_DEV_GPIO_PIN_LEVEL_BASE..PATH_DEV_GPIO_PIN_LEVEL_BASE + 16).contains(&p) => {
                 Node::DevGpioPinLevel((p - PATH_DEV_GPIO_PIN_LEVEL_BASE) as u8 + 1)
-            }
-            PATH_TASK => Node::Task,
-            PATH_TASK_ALLOC => Node::TaskAlloc,
-            p if (PATH_TASK_DIR_BASE + 1..PATH_TASK_DIR_BASE + 9).contains(&p) => {
-                Node::TaskDir((p - PATH_TASK_DIR_BASE) as u8)
-            }
-            p if p >= PATH_TASK_FILE_BASE && p < PATH_TASK_FILE_BASE + 64 => {
-                let off = p - PATH_TASK_FILE_BASE;
-                let rid = (off / 8 + 1) as u8;
-                let kind = TaskFileKind::from_index(off % 8)?;
-                Node::TaskFile(rid, kind)
             }
             _ => return None,
         })
@@ -380,7 +387,7 @@ impl Node {
             Node::TaskAlloc => PATH_TASK_ALLOC,
             Node::TaskDir(rid) => PATH_TASK_DIR_BASE + rid as u64,
             Node::TaskFile(rid, kind) => {
-                PATH_TASK_FILE_BASE + (rid as u64 - 1) * 8 + kind as u64
+                PATH_TASK_FILE_BASE + (rid as u64 - 1) * TASK_FILES_PER_RID + kind as u64
             }
         }
     }
@@ -520,7 +527,8 @@ impl Node {
             // Streaming files: large fake length prevents v9fs page cache from
             // returning EOF based on i_size=0 before data is available.
             Node::DevBtnEvent | Node::DevMicPcm | Node::DevSpkPcm => u32::MAX as u64,
-            Node::TaskFile(rid, TaskFileKind::Data) => task_data_len(rid),
+            #[cfg(feature = "wamr")]
+            Node::TaskFile(rid, TaskFileKind::Data) => devices::task::data_out_len(rid),
             #[cfg(feature = "wamr")]
             Node::TaskFile(rid, TaskFileKind::Cmd) => {
                 devices::task::field_len(rid, devices::task::TaskField::Cmd)
@@ -535,6 +543,8 @@ impl Node {
             }
             #[cfg(feature = "wamr")]
             Node::TaskFile(_rid, TaskFileKind::Id) => 2,
+            #[cfg(feature = "wamr")]
+            Node::TaskFile(rid, TaskFileKind::Status) => devices::task::status_len(rid),
             _ => 0,
         }
     }
@@ -627,6 +637,7 @@ impl Node {
             (Node::TaskDir(rid), "id") => Some(Node::TaskFile(rid, TaskFileKind::Id)),
             (Node::TaskDir(rid), "exit") => Some(Node::TaskFile(rid, TaskFileKind::Exit)),
             (Node::TaskDir(rid), "data") => Some(Node::TaskFile(rid, TaskFileKind::Data)),
+            (Node::TaskDir(rid), "status") => Some(Node::TaskFile(rid, TaskFileKind::Status)),
             _ => None,
         }
     }
@@ -699,6 +710,7 @@ impl Node {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct FsContext<'a> {
     pub board_name: &'a str,
     pub version: &'a str,
@@ -752,7 +764,7 @@ pub struct FsContext<'a> {
     /// the pin is configured as input) and return it.
     pub refresh_gpio_level: fn(u8),
     /// `/ctl` writes — `msize <N>` is accepted (no-op) and `exec <path> [args…]`
-    /// allocates a task and sets `cmd` (does not start; see `/task/<rid>/ctl`).
+    /// allocates a task, sets `cmd`, and starts it (see `/task/<rid>/ctl` for manual start).
     pub on_root_ctl: fn(&str) -> Result<(), &'static str>,
 }
 
@@ -1188,13 +1200,9 @@ fn read_task_file(rid: u8, kind: TaskFileKind, off: u64, buf: &mut [u8]) -> usiz
         TaskFileKind::Cmd => devices::task::read_field(rid, TaskField::Cmd, off, buf),
         TaskFileKind::WorkDir => devices::task::read_field(rid, TaskField::Dir, off, buf),
         TaskFileKind::Env => devices::task::read_field(rid, TaskField::Env, off, buf),
+        TaskFileKind::Status => devices::task::read_status(rid, off, buf),
         TaskFileKind::Ctl => 0,
     }
-}
-
-#[cfg(feature = "wamr")]
-fn task_data_len(rid: u8) -> u64 {
-    devices::task::data_out_len(rid)
 }
 
 #[cfg(feature = "wamr")]
@@ -1252,7 +1260,7 @@ fn push_rid_name(name: &mut heapless::String<4>, rid: u8) {
 
 #[cfg(feature = "wamr")]
 pub fn pack_task_dir_list(rid: u8, off: u64, buf: &mut [u8]) -> usize {
-    const KINDS: [TaskFileKind; 7] = [
+    const KINDS: [TaskFileKind; 8] = [
         TaskFileKind::Ctl,
         TaskFileKind::Cmd,
         TaskFileKind::WorkDir,
@@ -1260,6 +1268,7 @@ pub fn pack_task_dir_list(rid: u8, off: u64, buf: &mut [u8]) -> usize {
         TaskFileKind::Id,
         TaskFileKind::Exit,
         TaskFileKind::Data,
+        TaskFileKind::Status,
     ];
     let mut written = 0usize;
     let mut skip = off as usize;

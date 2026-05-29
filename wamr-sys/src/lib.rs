@@ -24,6 +24,13 @@ pub fn set_runtime_heap(heap: *mut u8, len: usize) {
     }
 }
 
+/// Abort the guest currently inside [`run`] (safe from another core).
+pub fn terminate_guest() {
+    unsafe {
+        stick_wamr_terminate();
+    }
+}
+
 /// Initialize WAMR once after [`set_runtime_heap`] (call from ProCpu boot, not AppCpu).
 pub fn init_runtime() -> Result<(), ()> {
     let rc = unsafe { stick_wamr_init_runtime() };

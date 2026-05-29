@@ -213,6 +213,7 @@ async fn main(spawner: Spawner) -> ! {
             ),
             Err(e) => println!("wasm: pool reserve failed: {}", e),
         }
+        firmware::net::services::install_wasm_vfs();
 
         let cpu_ctrl: CPU_CTRL<'static> = unsafe { core::mem::transmute(peripherals.CPU_CTRL) };
         firmware::dev::wasm_core::start(cpu_ctrl, sw_interrupt.software_interrupt1);
@@ -236,6 +237,7 @@ async fn main(spawner: Spawner) -> ! {
             ),
             Err(e) => println!("wasm: pool reserve failed: {}", e),
         }
+        firmware::net::services::install_wasm_vfs();
         let cpu_ctrl: CPU_CTRL<'static> = unsafe { core::mem::transmute(peripherals.CPU_CTRL) };
         firmware::dev::wasm_core::start(cpu_ctrl, sw_interrupt.software_interrupt1);
     }

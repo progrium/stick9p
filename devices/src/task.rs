@@ -1,7 +1,7 @@
 //! WASM task slots exposed as `/task/<rid>/…` (configure + `ctl start`).
 //!
-//! [`exec_configure`] (from `/ctl exec …`) allocates a task and sets `cmd` without
-//! starting. The core-1 worker runs [`run_pending`] when `ctl` receives `start`.
+//! [`exec_configure`] (from `/ctl exec …`) allocates a task, sets `cmd`, and
+//! starts it (same as writing `start` to `/task/<rid>/ctl`).
 
 extern crate alloc;
 
@@ -28,6 +28,45 @@ const PH_CONFIGURED: u8 = 1;
 const PH_PENDING: u8 = 2;
 const PH_RUNNING: u8 = 3;
 const PH_EXITED: u8 = 4;
+const PH_TERMINATED: u8 = 5;
+
+static TERMINATE_RID: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(feature = "log")]
+macro_rules! task_log {
+    ($($t:tt)*) => {
+        esp_println::println!($($t)*);
+    };
+}
+#[cfg(not(feature = "log"))]
+macro_rules! task_log {
+    ($($t:tt)*) => {};
+}
+
+fn phase_name(phase: u8) -> &'static str {
+    match phase {
+        PH_FREE => "free",
+        PH_CONFIGURED => "configured",
+        PH_PENDING => "pending",
+        PH_RUNNING => "running",
+        PH_EXITED => "exited",
+        PH_TERMINATED => "terminated",
+        _ => "unknown",
+    }
+}
+
+fn set_phase(t: &mut Task, rid: u8, phase: u8, detail: &str) {
+    if t.phase != phase {
+        task_log!(
+            "task: rid={} {} -> {} ({})",
+            rid,
+            phase_name(t.phase),
+            phase_name(phase),
+            detail
+        );
+        t.phase = phase;
+    }
+}
 
 struct Task {
     phase: u8,
@@ -133,21 +172,26 @@ fn alloc_slot() -> Result<u8, &'static str> {
     critical_section::with(|cs| {
         let mut tasks = TASKS.borrow(cs).borrow_mut();
         for (i, t) in tasks.iter_mut().enumerate() {
-            if t.phase == PH_FREE || t.phase == PH_EXITED {
+            if t.phase == PH_FREE || t.phase == PH_EXITED || t.phase == PH_TERMINATED {
                 *t = Task::INIT;
                 t.phase = PH_CONFIGURED;
-                let _ = t.dir.push_str(".");
-                return Ok((i + 1) as u8);
+                let _ = t.dir.push_str("/");
+                let rid = (i + 1) as u8;
+                task_log!("task: rid={} allocated", rid);
+                return Ok(rid);
             }
         }
         Err("task: no free slots")
     })
 }
 
-/// `/ctl exec …` — allocate and set `cmd` (does not start).
+/// `/ctl exec …` — allocate, set `cmd`, and start.
 pub fn exec_configure(line: &str) -> Result<(), &'static str> {
     let rid = alloc_slot()?;
     set_cmd(rid, line)?;
+    if let Err(e) = start(rid) {
+        record_start_error(rid, e)?;
+    }
     Ok(())
 }
 
@@ -159,6 +203,37 @@ pub fn read_id(rid: u8, off: u64, buf: &mut [u8]) -> usize {
     let _ = push_u8(&mut line, rid);
     let _ = line.push('\n');
     copy_bytes(line.as_bytes(), off, buf)
+}
+
+/// Read `/task/<rid>/status` — `allocated`, `started`, `exited`, `error`, or `terminated`.
+pub fn read_status(rid: u8, off: u64, buf: &mut [u8]) -> usize {
+    let line = critical_section::with(|cs| status_line_for(&TASKS.borrow(cs).borrow(), rid));
+    copy_bytes(line.as_bytes(), off, buf)
+}
+
+pub fn status_len(rid: u8) -> u64 {
+    critical_section::with(|cs| {
+        status_line_for(&TASKS.borrow(cs).borrow(), rid).len() as u64
+    })
+}
+
+fn status_line_for(tasks: &[Task; MAX_TASKS], rid: u8) -> heapless::String<16> {
+    let mut s = heapless::String::new();
+    let Some(idx) = rid_to_idx(rid) else {
+        return s;
+    };
+    let t = &tasks[idx];
+    let label = match t.phase {
+        PH_CONFIGURED => "allocated",
+        PH_PENDING | PH_RUNNING => "started",
+        PH_EXITED if t.exit_code == 0 => "exited",
+        PH_EXITED => "error",
+        PH_TERMINATED => "terminated",
+        _ => return s,
+    };
+    let _ = s.push_str(label);
+    let _ = s.push('\n');
+    s
 }
 
 pub fn read_exit(rid: u8, off: u64, buf: &mut [u8]) -> usize {
@@ -224,6 +299,32 @@ pub fn field_len(rid: u8, field: TaskField) -> u64 {
     })
 }
 
+/// Append guest stdout/stderr while the task is running (C hook from WASI `fd_write`).
+#[unsafe(no_mangle)]
+pub extern "C" fn stick_wasm_output_append(buf: *const u8, len: u32) {
+    if buf.is_null() || len == 0 {
+        return;
+    }
+    let data = unsafe { core::slice::from_raw_parts(buf, len as usize) };
+    append_live_output(data);
+}
+
+fn append_live_output(data: &[u8]) {
+    let rid = runner_rid();
+    if rid == 0 {
+        return;
+    }
+    critical_section::with(|cs| {
+        let mut tasks = TASKS.borrow(cs).borrow_mut();
+        let Some(idx) = rid_to_idx(rid) else {
+            return;
+        };
+        if let Some(data_out) = &mut tasks[idx].data_out {
+            append_out(data_out, data);
+        }
+    });
+}
+
 pub fn data_out_len(rid: u8) -> u64 {
     critical_section::with(|cs| {
         let tasks = TASKS.borrow(cs).borrow();
@@ -265,7 +366,7 @@ pub fn write_field(
         if t.started {
             return Err("task: already started");
         }
-        if t.phase == PH_EXITED {
+        if t.phase == PH_EXITED || t.phase == PH_TERMINATED {
             return Err("task: exited");
         }
         match field {
@@ -304,7 +405,7 @@ fn record_start_error(rid: u8, msg: &'static str) -> Result<(), &'static str> {
             return Ok(());
         }
         t.started = true;
-        t.phase = PH_EXITED;
+        set_phase(t, rid, PH_EXITED, "start error");
         t.exit_code = -1;
         let mut out = new_data_buf().unwrap_or_default();
         let mut line = heapless::String::<256>::new();
@@ -320,13 +421,58 @@ fn record_start_error(rid: u8, msg: &'static str) -> Result<(), &'static str> {
 
 pub fn write_ctl(rid: u8, line: &str) -> Result<(), &'static str> {
     let cmd = line.trim();
-    if cmd != "start" {
-        return Err("task: bad ctl");
+    match cmd {
+        "start" => {
+            if let Err(e) = start(rid) {
+                record_start_error(rid, e)?;
+            }
+            Ok(())
+        }
+        "terminate" => request_terminate(rid),
+        _ => Err("task: bad ctl"),
     }
-    if let Err(e) = start(rid) {
-        record_start_error(rid, e)?;
+}
+
+pub fn request_terminate(rid: u8) -> Result<(), &'static str> {
+    critical_section::with(|cs| {
+        let mut tasks = TASKS.borrow(cs).borrow_mut();
+        let Some(idx) = rid_to_idx(rid) else {
+            return Err("task: not found");
+        };
+        let t = &mut tasks[idx];
+        match t.phase {
+            PH_FREE => Err("task: not found"),
+            PH_CONFIGURED => {
+                set_phase(t, rid, PH_TERMINATED, "ctl terminate (not started)");
+                Ok(())
+            }
+            PH_PENDING => {
+                set_phase(t, rid, PH_TERMINATED, "ctl terminate (pending)");
+                set_runner(0);
+                TERMINATE_RID.store(0, Ordering::Release);
+                Ok(())
+            }
+            PH_RUNNING => {
+                task_log!("task: rid={} terminate requested (running)", rid);
+                TERMINATE_RID.store(rid, Ordering::Release);
+                wamr_sys::terminate_guest();
+                Ok(())
+            }
+            PH_EXITED => Err("task: already finished"),
+            PH_TERMINATED => Err("task: already finished"),
+            _ => Err("task: bad phase"),
+        }
+    })
+}
+
+/// Checked from WASI while a guest is running (cooperative stop on next I/O).
+#[unsafe(no_mangle)]
+pub extern "C" fn stick_task_should_terminate() -> bool {
+    let rid = runner_rid();
+    if rid == 0 {
+        return false;
     }
-    Ok(())
+    TERMINATE_RID.load(Ordering::Acquire) == rid
 }
 
 pub fn write_data(rid: u8, off: u64, data: &[u8]) -> Result<usize, &'static str> {
@@ -336,7 +482,7 @@ pub fn write_data(rid: u8, off: u64, data: &[u8]) -> Result<usize, &'static str>
             return Err("task: not found");
         };
         let t = &mut tasks[idx];
-        if t.phase == PH_EXITED {
+        if t.phase == PH_EXITED || t.phase == PH_TERMINATED {
             return Err("task: exited");
         }
         if t.phase != PH_RUNNING && t.phase != PH_PENDING {
@@ -405,8 +551,9 @@ fn start(rid: u8) -> Result<(), &'static str> {
         t.data_out = Some(new_data_buf()?);
         t.data_in = Some(Vec::new());
         t.started = true;
-        t.phase = PH_PENDING;
+        set_phase(t, rid, PH_PENDING, "ctl start");
         set_runner(rid);
+        task_log!("task: rid={} start cmd={}", rid, t.cmd.as_str());
         Ok(())
     })
 }
@@ -587,6 +734,11 @@ fn push_runner_status(s: &mut String<200>, rid: u8) {
                 let _ = s.push_str(t.basename.as_str());
                 let _ = s.push('\n');
             }
+            PH_TERMINATED => {
+                let _ = s.push_str("terminated ");
+                let _ = s.push_str(t.basename.as_str());
+                let _ = s.push('\n');
+            }
             PH_CONFIGURED => {
                 let _ = s.push_str("configured rid=");
                 let _ = push_u8(s, rid);
@@ -607,12 +759,18 @@ pub fn run_pending() -> bool {
     let phase = critical_section::with(|cs| {
         TASKS.borrow(cs).borrow()[rid as usize - 1].phase
     });
+    if phase == PH_TERMINATED {
+        set_runner(0);
+        TERMINATE_RID.store(0, Ordering::Release);
+        return false;
+    }
     if phase != PH_PENDING {
         return false;
     }
 
     critical_section::with(|cs| {
-        TASKS.borrow(cs).borrow_mut()[rid as usize - 1].phase = PH_RUNNING;
+        let t = &mut TASKS.borrow(cs).borrow_mut()[rid as usize - 1];
+        set_phase(t, rid, PH_RUNNING, "core1 run");
     });
 
     let (wasm_ino, argv, env_lines, dir, basename) = critical_section::with(|cs| {
@@ -628,33 +786,56 @@ pub fn run_pending() -> bool {
         )
     });
 
+    task_log!(
+        "task: rid={} wasm run ino={} argv0={}",
+        rid,
+        wasm_ino,
+        argv.first().map(|a| a.as_str()).unwrap_or("")
+    );
     let run_outcome = run_guest(wasm_ino, &argv, &env_lines, dir.as_str());
+    let terminated = TERMINATE_RID.swap(0, Ordering::AcqRel) == rid;
+    let user_terminated = terminated
+        || matches!(&run_outcome, RunOutcome::Err(msg) if msg.as_str().contains("terminated"));
 
     critical_section::with(|cs| {
         let mut tasks = TASKS.borrow(cs).borrow_mut();
         let t = &mut tasks[rid as usize - 1];
-        match run_outcome {
-            RunOutcome::Ok(out) => {
-                t.exit_code = 0;
-                if let Some(data_out) = &mut t.data_out {
-                    append_out(data_out, out.as_bytes());
-                }
+        if user_terminated {
+            t.exit_code = 0;
+            if let Some(data_out) = &mut t.data_out {
+                append_out(data_out, b"terminated\n");
             }
-            RunOutcome::Err(msg) => {
-                t.exit_code = -1;
-                let mut line = heapless::String::<256>::new();
-                let _ = line.push_str("wasm error: ");
-                let _ = line.push_str(msg.as_str());
-                if !line.ends_with('\n') {
-                    let _ = line.push('\n');
+            set_phase(t, rid, PH_TERMINATED, "ctl terminate (during run)");
+        } else {
+            match run_outcome {
+                RunOutcome::Ok(out) => {
+                    t.exit_code = 0;
+                    // Stdio already streamed into `data_out` via `stick_wasm_output_append`.
+                    if let Some(data_out) = &mut t.data_out {
+                        if data_out.is_empty() {
+                            append_out(data_out, out.as_bytes());
+                        }
+                    }
+                    set_phase(t, rid, PH_EXITED, "guest exit ok");
+                    task_log!("task: rid={} exited code=0", rid);
                 }
-                if let Some(data_out) = &mut t.data_out {
-                    append_out(data_out, line.as_bytes());
+                RunOutcome::Err(msg) => {
+                    t.exit_code = -1;
+                    let mut line = heapless::String::<256>::new();
+                    let _ = line.push_str("wasm error: ");
+                    let _ = line.push_str(msg.as_str());
+                    if !line.ends_with('\n') {
+                        let _ = line.push('\n');
+                    }
+                    if let Some(data_out) = &mut t.data_out {
+                        append_out(data_out, line.as_bytes());
+                    }
+                    set_phase(t, rid, PH_EXITED, "guest exit error");
+                    task_log!("task: rid={} error: {}", rid, msg.as_str());
                 }
             }
         }
         t.data_in = None;
-        t.phase = PH_EXITED;
         set_runner(0);
     });
     let _ = basename;

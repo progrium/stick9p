@@ -247,6 +247,7 @@ fn main() {
         err: *mut ::core::ffi::c_char,
         err_len: u32,
     ) -> i32;
+    pub fn stick_wamr_terminate();
     pub fn stick_wamr_capture_ptr() -> *const ::core::ffi::c_char;
 }
 "#,

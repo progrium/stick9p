@@ -32,10 +32,7 @@ func main() {
 	}
 	fmt.Println()
 
-	// `.` is the WASI preopen the device hands us (fd 3). The stick host
-	// stubs out the underlying syscalls, so this may legitimately report
-	// an empty listing — the goal here is to prove `_start` ran and the
-	// `os` package wired through fd_readdir without trapping.
+	// `.` is the WASI preopen root (`/`). gocheck lists top-level 9P entries.
 	fmt.Print("Root:")
 	if entries, err := os.ReadDir("."); err == nil {
 		for _, e := range entries {

@@ -14,7 +14,7 @@ pub const WS_PORT: u16 = 8080;
 
 pub const GW_PROVISION: core::net::Ipv4Addr = core::net::Ipv4Addr::new(192, 168, 4, 1);
 
-fn fs_context() -> FsContext<'static> {
+pub fn fs_context() -> FsContext<'static> {
     FsContext {
         board_name: BOARD_NAME,
         version: FW_VERSION,
@@ -60,8 +60,13 @@ fn fs_context() -> FsContext<'static> {
     }
 }
 
+/// Wire the 9P [`FsContext`] into the core-1 WASM VFS (call once before running guests).
+pub fn install_wasm_vfs() {
+    ninep::vfs_ffi::set_fs_context(fs_context());
+}
+
 /// `/ctl` writes — `msize <N>` is a no-op (we always negotiate via
-/// Tversion); `exec <path>` allocates a task and sets `cmd` (does not start).
+/// Tversion); `exec <path>` allocates a task, sets `cmd`, and starts it.
 fn on_root_ctl(line: &str) -> Result<(), &'static str> {
     let line = line.trim();
     if line.is_empty() {

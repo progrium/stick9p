@@ -41,10 +41,12 @@ os_vprintf(const char *format, va_list ap)
 #endif
 }
 
+extern uint64_t stick_time_boot_us(void);
+
 uint64
 os_time_get_boot_us(void)
 {
-    return 0;
+    return stick_time_boot_us();
 }
 
 uint64

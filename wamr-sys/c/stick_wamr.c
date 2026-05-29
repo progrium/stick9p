@@ -30,6 +30,7 @@ static volatile uint32_t g_runtime_heap_size;
 static char g_runtime_heap_static[RUNTIME_HEAP_BYTES];
 #endif
 static volatile bool g_runtime_ready;
+static wasm_module_inst_t g_active_inst;
 #if WASM_ENABLE_LIBC_WASI == 0
 static bool g_natives_registered;
 #endif
@@ -77,6 +78,23 @@ capture_append(const char *data, size_t len)
     g_capture[g_capture_len] = '\0';
 }
 
+void
+stick_wamr_capture_append(const uint8_t *data, size_t len)
+{
+    capture_append((const char *)data, len);
+}
+
+extern void stick_wasm_output_append(const uint8_t *buf, uint32_t len);
+
+void
+stick_wamr_stream_output(const uint8_t *data, size_t len)
+{
+    if (!data || len == 0) {
+        return;
+    }
+    stick_wasm_output_append(data, (uint32_t)len);
+}
+
 int
 stick_wamr_vprintf(const char *format, va_list ap)
 {
@@ -84,6 +102,7 @@ stick_wamr_vprintf(const char *format, va_list ap)
     int n = vsnprintf(tmp, sizeof(tmp), format, ap);
     if (n > 0) {
         capture_append(tmp, (size_t)n);
+        stick_wasm_output_append((const uint8_t *)tmp, (uint32_t)n);
     }
     return n;
 }
@@ -196,8 +215,9 @@ stick_wamr_run(const uint8_t *wasm_bytes, uint32_t wasm_len, char *argv[],
     uint8_t *wasm_copy = NULL;
     LoadArgs load_args;
 #if WASM_ENABLE_LIBC_WASI != 0
-    const char *dir_default = ".";
+    const char *dir_default = "/";
     const char *dir_list[WASI_DIR_COUNT];
+    const char *map_list[WASI_DIR_COUNT] = { "/::/" };
     static char argv_bufs[STICK_MAX_ARGV][STICK_STR_LEN];
     static char *argv_copy[STICK_MAX_ARGV];
     static char env_bufs[STICK_MAX_ENV][STICK_STR_LEN];
@@ -251,9 +271,9 @@ stick_wamr_run(const uint8_t *wasm_bytes, uint32_t wasm_len, char *argv[],
         wasm_runtime_free(wasm_copy);
         return -1;
     }
-    wasm_runtime_set_wasi_args(module, dir_list, WASI_DIR_COUNT, NULL, 0,
-                               (const char **)env_copy, env_count, argv_copy,
-                               (int)argc);
+    wasm_runtime_set_wasi_args_ex(module, dir_list, WASI_DIR_COUNT, map_list,
+                                  WASI_DIR_COUNT, (const char **)env_copy,
+                                  env_count, argv_copy, (int)argc, -1, -1, -1);
 #endif
 
     module_inst = wasm_runtime_instantiate(module, GUEST_STACK_BYTES,
@@ -264,18 +284,30 @@ stick_wamr_run(const uint8_t *wasm_bytes, uint32_t wasm_len, char *argv[],
         return -1;
     }
 
+    g_active_inst = module_inst;
     if (!wasm_application_execute_main(module_inst, 0, NULL)) {
         exception = wasm_runtime_get_exception(module_inst);
         snprintf(err, err_len, "%s",
                  exception ? exception : "wasm call failed");
+        g_active_inst = NULL;
         wasm_runtime_deinstantiate(module_inst);
         wasm_runtime_unload(module);
         wasm_runtime_free(wasm_copy);
         return -1;
     }
 
+    g_active_inst = NULL;
     wasm_runtime_deinstantiate(module_inst);
     wasm_runtime_unload(module);
     wasm_runtime_free(wasm_copy);
     return 0;
+}
+
+void
+stick_wamr_terminate(void)
+{
+    wasm_module_inst_t inst = g_active_inst;
+    if (inst) {
+        wasm_runtime_terminate(inst);
+    }
 }

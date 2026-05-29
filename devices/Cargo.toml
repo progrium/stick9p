@@ -8,8 +8,10 @@ description = "Stick device drivers and shared state"
 [features]
 default = ["wamr"]
 wamr = ["dep:wamr-sys"]
+log = ["dep:esp-println"]
 
 [dependencies]
 critical-section = "1.2.0"
+esp-println = { version = "0.17", optional = true, default-features = false }
 heapless = "0.8"
 wamr-sys = { path = "../wamr-sys", optional = true }

@@ -95,7 +95,7 @@ where
             if let Some((kind, p)) = self.pending_stream.as_ref() {
                 let max_count = max_read_count(p.count, self.msize);
                 let buf = &mut self.storage.rx[..max_count];
-                let n = match kind {
+                let reply_n = match kind {
                     PendingKind::BtnEvent => {
                         let n = buttons::try_read_event(0, buf);
                         self.btn_poll_count += 1;
@@ -104,14 +104,25 @@ where
                         }
                         if n > 0 && n < buf.len() {
                             buf[n..].fill(0);
-                            buf.len()
+                            Some(buf.len())
+                        } else if n > 0 {
+                            Some(n)
                         } else {
-                            n
+                            None
                         }
                     }
-                    PendingKind::MicPcm => mic::try_read_pcm(0, buf),
+                    PendingKind::MicPcm => {
+                        let n = mic::try_read_pcm(0, buf);
+                        if n > 0 {
+                            Some(n)
+                        } else if mic::is_running() {
+                            None
+                        } else {
+                            Some(0)
+                        }
+                    }
                 };
-                if n > 0 {
+                if let Some(n) = reply_n {
                     ninep_log!("9p: pend-drain {} bytes (tag={})", n, p.tag);
                     let reply_len = build_read_reply(&mut self.storage.tx, p.tag, &buf[..n]);
                     if write_all(&mut self.stream, &self.storage.tx[..reply_len])
@@ -588,6 +599,10 @@ where
             FidTarget::Static(Node::Task) => fs::pack_task_root_dir_list(offset, data),
             #[cfg(feature = "wamr")]
             FidTarget::Static(Node::TaskDir(rid)) => fs::pack_task_dir_list(rid, offset, data),
+            #[cfg(feature = "wamr")]
+            FidTarget::Static(Node::TaskFile(rid, fs::TaskFileKind::Data)) => {
+                devices::task::read_data(rid, offset, data).min(max_count)
+            }
             FidTarget::Static(node) if !node.children().is_empty() && !node.uses_custom_dir_list() => {
                 fs::pack_dir_list(node, offset, data)
             }

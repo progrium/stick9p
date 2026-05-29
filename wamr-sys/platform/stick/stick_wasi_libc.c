@@ -14,6 +14,10 @@
 #include <string.h>
 #include <time.h>
 
+extern bool stick_task_should_terminate(void);
+
+#define STICK_SLEEP_SLICE_US 5000ULL
+
 static int stick_errno;
 static struct _reent stick_reent;
 
@@ -222,13 +226,60 @@ clock_gettime(clockid_t clk_id, struct timespec *tp)
     return 0;
 }
 
+static int
+nanosleep_set_rem(uint64_t deadline_us, uint64_t now_us, struct timespec *rem)
+{
+    uint64_t left_us;
+
+    if (!rem) {
+        return 0;
+    }
+    if (now_us >= deadline_us) {
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+        return 0;
+    }
+    left_us = deadline_us - now_us;
+    rem->tv_sec = (time_t)(left_us / 1000000ULL);
+    rem->tv_nsec = (long)((left_us % 1000000ULL) * 1000ULL);
+    return 0;
+}
+
 int
 nanosleep(const struct timespec *req, struct timespec *rem)
 {
-    (void)req;
-    if (rem) {
-        rem->tv_sec = 0;
-        rem->tv_nsec = 0;
+    uint64_t sleep_us, deadline_us, now_us;
+
+    if (!req) {
+        errno = EINVAL;
+        return -1;
+    }
+    sleep_us = (uint64_t)req->tv_sec * 1000000ULL
+               + (uint64_t)req->tv_nsec / 1000ULL;
+    if (sleep_us == 0) {
+        return 0;
+    }
+    deadline_us = os_time_get_boot_us() + sleep_us;
+    while ((now_us = os_time_get_boot_us()) < deadline_us) {
+        if (stick_task_should_terminate()) {
+            nanosleep_set_rem(deadline_us, now_us, rem);
+            errno = EINTR;
+            return -1;
+        }
+        {
+            uint64_t slice_end = now_us + STICK_SLEEP_SLICE_US;
+            if (slice_end > deadline_us) {
+                slice_end = deadline_us;
+            }
+            while (os_time_get_boot_us() < slice_end) {
+                if (stick_task_should_terminate()) {
+                    now_us = os_time_get_boot_us();
+                    nanosleep_set_rem(deadline_us, now_us, rem);
+                    errno = EINTR;
+                    return -1;
+                }
+            }
+        }
     }
     return 0;
 }

@@ -34,7 +34,7 @@ board-sticks3 = [
 ]
 
 [dependencies]
-devices = { path = "../devices", features = ["wamr"] }
+devices = { path = "../devices", features = ["wamr", "log"] }
 ninep = { path = "../ninep", features = ["server", "log", "wamr"] }
 
 esp-hal = { version = "~1.1.0", features = ["unstable"] }
